@@ -23,6 +23,7 @@
 
 /* LoRa bridge commands */
 #define CMD_LINK_DATA          0x20
+#define CMD_RF_STATS           0x21U
 #define CMD_LINK_ACK           0xA0
 
 typedef struct

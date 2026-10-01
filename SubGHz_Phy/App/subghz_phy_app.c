@@ -71,6 +71,9 @@ static uint16_t RxBufferSize = 0U;
 int8_t RssiValue = 0;
 int8_t SnrValue = 0;
 
+
+static volatile int16_t g_rx_rssi_dbm = 0;
+static volatile int8_t  g_rx_snr_db = 0;
 /* Radio state */
 static uint8_t radio_tx_active = 0U;
 
@@ -504,6 +507,8 @@ static void OnRxDone(
     int16_t rssi,
     int8_t LoraSnr_FskCfo)
 {
+	g_rx_rssi_dbm = rssi;
+	g_rx_snr_db = LoraSnr_FskCfo;
     g_lora_rx_done++;
 
     RssiValue = (int8_t)rssi;
@@ -744,13 +749,24 @@ static void Board1_ProcessReceived(void)
 
 #if (BOARD_ROLE == BOARD_2_RX)
 
+
 static void Board2_ProcessReceived(void)
 {
     ProtocolFrame frame;
 
     uint16_t ack_length;
+    uint16_t rf_length;
 
-    /* Decode packet and check CRC */
+    /* RF frame: 9-byte overhead + 3-byte payload */
+    uint8_t rf_packet[12];
+    uint8_t rf_payload[3];
+
+    int16_t rssi;
+
+    /* =====================================================
+     * 1. Decode received LoRa packet and check CRC
+     * ===================================================== */
+
     if (Protocol_DecodeFrame(
             BufferRx,
             RxBufferSize,
@@ -770,21 +786,85 @@ static void Board2_ProcessReceived(void)
         return;
     }
 
-    /*
-     * Forward the COMPLETE protocol frame to RS485:
+    /* =====================================================
+     * 2. Forward valid packet to RS485
      *
-     * AA 55 DST SRC CMD SEQ LEN [GPIO mask][RS485 data...] CRC
-     *
-     * payload[0] = 4 opto input states (the master reads them from here)
-     * payload[1..] = optional RS485 data
-     * A frame with len == 1 is the 1 s heartbeat (inputs only) and
-     * MUST be forwarded, otherwise the master never sees the inputs.
-     *
-     * Duplicate (resent) packets are not forwarded twice.
-     */
+     * Duplicate packets are not forwarded twice.
+     * ===================================================== */
+
     if ((last_rx_sequence_valid == 0U) ||
         (last_rx_sequence != frame.seq))
     {
+        /* =================================================
+         * 3. Build RF signal information
+         *
+         * RF Payload:
+         *
+         * Byte 0: RSSI LOW
+         * Byte 1: RSSI HIGH
+         * Byte 2: SNR
+         *
+         * Command = 0x21
+         * Sequence = Same as DATA packet
+         * ================================================= */
+
+        rssi = g_rx_rssi_dbm;
+
+        rf_payload[0] =
+            (uint8_t)((uint16_t)rssi & 0xFFU);
+
+        rf_payload[1] =
+            (uint8_t)(((uint16_t)rssi >> 8U) & 0xFFU);
+
+        rf_payload[2] =
+            (uint8_t)g_rx_snr_db;
+
+        rf_length = Protocol_BuildFrame(
+            rf_packet,
+
+            DEVICE_ADDR_MASTER,
+            DEVICE_ADDR_BOARD2,
+
+            CMD_RF_STATS,
+
+            frame.seq,
+
+            rf_payload,
+            sizeof(rf_payload));
+
+        if (rf_length == 0U)
+        {
+            LoRa_StartRx();
+            return;
+        }
+
+        /* =================================================
+         * 4. Send RF information to PC via RS485
+         * ================================================= */
+
+        if (RS485_Send(
+                rf_packet,
+                rf_length) == 0U)
+        {
+            LoRa_StartRx();
+            return;
+        }
+
+        /* =================================================
+         * 5. Send COMPLETE original DATA frame
+         *
+         * IMPORTANT:
+         *
+         * Keep the complete frame:
+         *
+         * AA 55 DST SRC CMD SEQ LEN PAYLOAD CRC
+         *
+         * payload[0]  = GPIO MASK
+         * payload[1..] = Temperature / RS485 data
+         *
+         * Also forward heartbeat packets (LEN = 1).
+         * ================================================= */
+
         if (RS485_Send(
                 BufferRx,
                 RxBufferSize) == 0U)
@@ -793,12 +873,18 @@ static void Board2_ProcessReceived(void)
             return;
         }
 
+        /* Remember successfully forwarded packet */
         last_rx_sequence = frame.seq;
 
         last_rx_sequence_valid = 1U;
     }
 
-    /* Build ACK packet (sent also for duplicates) */
+    /* =====================================================
+     * 6. Build ACK
+     *
+     * ACK is also transmitted for duplicate packets.
+     * ===================================================== */
+
     ack_length = Protocol_BuildFrame(
         BufferTx,
 
@@ -818,14 +904,19 @@ static void Board2_ProcessReceived(void)
         return;
     }
 
-    /*
-     * Allow Board 1 enough time to switch
-     * from TX to RX before transmitting ACK.
-     */
+    /* =====================================================
+     * 7. Allow Board 1 to switch from TX to RX
+     * ===================================================== */
+
     HAL_Delay(
         Radio.GetWakeupTime() + RX_TIME_MARGIN);
 
-    /* PA11 will turn ON here (ACK transmission indicator) */
+    /* =====================================================
+     * 8. Transmit ACK
+     *
+     * PA11 turns ON during ACK transmission.
+     * ===================================================== */
+
     LoRa_StartTx(ack_length);
 }
 

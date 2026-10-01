@@ -27,7 +27,7 @@
 
 /* ================= LORA ================= */
 
-#define HEARTBEAT_PERIOD_MS  1000U
+#define HEARTBEAT_PERIOD_MS  3000U
 
 /* Hold TX LED after transmission to make it visible */
 #define LED_TX_HOLD_MS       150U
