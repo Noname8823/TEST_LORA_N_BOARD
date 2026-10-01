@@ -11,7 +11,7 @@
  * BOARD 1: BOARD_1_TX
  * BOARD 2: BOARD_2_RX
  */
-#define BOARD_ROLE BOARD_1_TX
+#define BOARD_ROLE BOARD_2_RX
 
 #if ((BOARD_ROLE != BOARD_1_TX) && \
      (BOARD_ROLE != BOARD_2_RX))

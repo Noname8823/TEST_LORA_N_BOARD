@@ -1,4 +1,3 @@
-
 #include "platform.h"
 #include "sys_app.h"
 #include "subghz_phy_app.h"
@@ -29,6 +28,9 @@
 #define RX_TIME_MARGIN        200U
 
 #define FSK_AFC_BANDWIDTH     83333U
+
+/* Board 1: number of resend attempts when ACK is lost */
+#define LINK_MAX_RETRY        3U
 
 #if (PAYLOAD_LEN > MAX_APP_BUFFER_SIZE)
 #error "Invalid LoRa payload size"
@@ -87,6 +89,9 @@ volatile uint32_t g_lora_rx_done = 0U;
 volatile uint32_t g_lora_tx_timeout = 0U;
 volatile uint32_t g_lora_rx_error = 0U;
 
+volatile uint32_t g_lora_retry = 0U;
+volatile uint32_t g_lora_drop = 0U;
+
 #if (BOARD_ROLE == BOARD_1_TX)
 
 /* Heartbeat timer */
@@ -94,7 +99,7 @@ static UTIL_TIMER_Object_t timerHeartbeat;
 
 static volatile uint8_t heartbeat_due = 0U;
 
-/* Pending RS485 data */
+/* Pending RS485 data (kept until ACK is received) */
 static uint8_t serial_pending[RS485_DATA_MAX];
 
 static uint8_t serial_pending_length = 0U;
@@ -105,6 +110,11 @@ static uint8_t tx_sequence = 0U;
 
 static uint8_t waiting_sequence = 0U;
 static uint8_t waiting_ack = 0U;
+
+/* Retry handling */
+static uint8_t tx_carries_serial = 0U;  /* in-flight frame contains RS485 data */
+static uint8_t retry_count = 0U;
+static uint8_t resend_pending = 0U;     /* resend with the same sequence */
 
 #else
 
@@ -153,8 +163,6 @@ static void Board2_ProcessReceived(void);
 
 /* =========================================================
  * PA11 LED CONTROL
- *
- * IMPORTANT:
  *
  * HIGH = LED ON
  * LOW  = LED OFF
@@ -214,10 +222,7 @@ static void LoRa_StartTx(uint16_t length)
     /* Debug */
     g_lora_tx_start++;
 
-    /*
-     * PA11 HIGH:
-     * LED ON when LoRa transmission starts.
-     */
+    /* PA11 HIGH: LED ON when LoRa transmission starts */
     LED_TxOn();
 
     /* Start sending packet */
@@ -306,19 +311,10 @@ void SubghzApp_Init(void)
 
     radio_tx_active = 0U;
 
-    /*
-     * Critical:
-     * Always start with PA11 LOW.
-     */
+    /* Always start with PA11 LOW */
     LED_TxOff();
 
-    /* =====================================================
-     * LED TIMER
-     *
-     * One-shot timer.
-     * Do NOT start it continuously.
-     * ===================================================== */
-
+    /* LED timer: one-shot, started only after TX done */
     UTIL_TIMER_Create(
         &timerLed,
         LED_TX_HOLD_MS,
@@ -341,6 +337,10 @@ void SubghzApp_Init(void)
 
     waiting_ack = 0U;
     waiting_sequence = 0U;
+
+    tx_carries_serial = 0U;
+    retry_count = 0U;
+    resend_pending = 0U;
 
     UTIL_TIMER_Create(
         &timerHeartbeat,
@@ -373,11 +373,10 @@ void SubghzApp_Init(void)
 
     Radio.Init(&RadioEvents);
 
-    /* Original frequency: 917.3 MHz */
     Radio.SetChannel(RF_FREQUENCY);
 
     /* =====================================================
-     * ORIGINAL LORA CONFIGURATION
+     * ORIGINAL LORA / FSK CONFIGURATION
      * ===================================================== */
 
 #if ((USE_MODEM_LORA == 1) && (USE_MODEM_FSK == 0))
@@ -604,8 +603,12 @@ static void OnHeartbeatEvent(void *context)
  * BOARD 1 - BUILD AND SEND DATA PACKET
  *
  * Payload:
- * [0] = GPIO mask
+ * [0]    = GPIO mask
  * [1...] = Received RS485 data
+ *
+ * The RS485 data stays in serial_pending until the ACK
+ * arrives (see Board1_ProcessReceived), so it can be
+ * resent with the same sequence number after a timeout.
  * ========================================================= */
 
 static void Board1_TransmitPending(void)
@@ -640,10 +643,7 @@ static void Board1_TransmitPending(void)
     /* Read four opto states */
     payload[0] = Inputs_GetMask() & 0x0FU;
 
-    /*
-     * If RS485 data exists:
-     * Append it after GPIO mask.
-     */
+    /* If RS485 data exists: append it after GPIO mask */
     if (serial_pending_valid != 0U)
     {
         payload_length =
@@ -655,7 +655,16 @@ static void Board1_TransmitPending(void)
             serial_pending_length);
     }
 
-    sequence = tx_sequence++;
+    /* Resend uses the same sequence so Board 2 can drop duplicates */
+    if (resend_pending != 0U)
+    {
+        sequence = waiting_sequence;
+        resend_pending = 0U;
+    }
+    else
+    {
+        sequence = tx_sequence++;
+    }
 
     /* Build AA 55 protocol frame */
     tx_length = Protocol_BuildFrame(
@@ -678,15 +687,9 @@ static void Board1_TransmitPending(void)
 
     waiting_sequence = sequence;
 
-    /*
-     * Clear the pending message.
-     * Serial data has priority over heartbeat.
-     */
-    if (serial_pending_valid != 0U)
-    {
-        serial_pending_valid = 0U;
-        serial_pending_length = 0U;
-    }
+    /* Remember whether this frame carries RS485 data */
+    tx_carries_serial =
+        (serial_pending_valid != 0U) ? 1U : 0U;
 
     heartbeat_due = 0U;
 
@@ -719,6 +722,17 @@ static void Board1_ProcessReceived(void)
     {
         /* ACK received */
         waiting_ack = 0U;
+
+        /* Release RS485 data only if this frame carried it */
+        if (tx_carries_serial != 0U)
+        {
+            serial_pending_valid = 0U;
+            serial_pending_length = 0U;
+
+            tx_carries_serial = 0U;
+        }
+
+        retry_count = 0U;
     }
 }
 
@@ -757,9 +771,16 @@ static void Board2_ProcessReceived(void)
     }
 
     /*
-     * Forward the complete binary frame to RS485.
+     * Forward the COMPLETE protocol frame to RS485:
      *
-     * Prevent duplicate consecutive packets.
+     * AA 55 DST SRC CMD SEQ LEN [GPIO mask][RS485 data...] CRC
+     *
+     * payload[0] = 4 opto input states (the master reads them from here)
+     * payload[1..] = optional RS485 data
+     * A frame with len == 1 is the 1 s heartbeat (inputs only) and
+     * MUST be forwarded, otherwise the master never sees the inputs.
+     *
+     * Duplicate (resent) packets are not forwarded twice.
      */
     if ((last_rx_sequence_valid == 0U) ||
         (last_rx_sequence != frame.seq))
@@ -777,7 +798,7 @@ static void Board2_ProcessReceived(void)
         last_rx_sequence_valid = 1U;
     }
 
-    /* Build ACK packet */
+    /* Build ACK packet (sent also for duplicates) */
     ack_length = Protocol_BuildFrame(
         BufferTx,
 
@@ -804,10 +825,7 @@ static void Board2_ProcessReceived(void)
     HAL_Delay(
         Radio.GetWakeupTime() + RX_TIME_MARGIN);
 
-    /*
-     * PA11 will turn ON here.
-     * Board 2 LED only indicates ACK transmission.
-     */
+    /* PA11 will turn ON here (ACK transmission indicator) */
     LoRa_StartTx(ack_length);
 }
 
@@ -859,9 +877,7 @@ static void LoRa_Process(void)
             radio_tx_active = 0U;
 
             /*
-             * Do not turn off PA11 immediately.
-             *
-             * Keep LED ON for another 150 ms,
+             * Keep LED ON for another LED_TX_HOLD_MS,
              * then timerLed will turn it OFF.
              */
             UTIL_TIMER_Start(&timerLed);
@@ -890,8 +906,35 @@ static void LoRa_Process(void)
 
 #if (BOARD_ROLE == BOARD_1_TX)
 
-            /* ACK timeout */
-            waiting_ack = 0U;
+            if (waiting_ack != 0U)
+            {
+                /* ACK timeout */
+                waiting_ack = 0U;
+
+                if (tx_carries_serial != 0U)
+                {
+                    retry_count++;
+
+                    if (retry_count > LINK_MAX_RETRY)
+                    {
+                        /* Give up: drop RS485 data */
+                        g_lora_drop++;
+
+                        serial_pending_valid = 0U;
+                        serial_pending_length = 0U;
+
+                        tx_carries_serial = 0U;
+                        retry_count = 0U;
+                    }
+                    else
+                    {
+                        /* Resend the same data, same sequence */
+                        g_lora_retry++;
+
+                        resend_pending = 1U;
+                    }
+                }
+            }
 
 #endif
 
@@ -931,6 +974,12 @@ static void LoRa_Process(void)
 #if (BOARD_ROLE == BOARD_1_TX)
 
             waiting_ack = 0U;
+
+            /* Radio never sent it: try again with the same sequence */
+            if (tx_carries_serial != 0U)
+            {
+                resend_pending = 1U;
+            }
 
 #endif
 
