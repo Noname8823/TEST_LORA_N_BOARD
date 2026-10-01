@@ -20,6 +20,10 @@
 #include "main.h"
 #include "app_subghz_phy.h"
 #include "gpio.h"
+#include "app_inputs.h"
+#include "rs485.h"
+#include "usart.h"
+/* USER CODE END Includes */
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -85,9 +89,12 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_USART2_UART_Init();
   MX_SubGHz_Phy_Init();
   /* USER CODE BEGIN 2 */
+  Inputs_Init();
 
+  RS485_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -96,7 +103,9 @@ int main(void)
   {
     /* USER CODE END WHILE */
     MX_SubGHz_Phy_Process();
+    Inputs_Task();
 
+    RS485_Task();
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */

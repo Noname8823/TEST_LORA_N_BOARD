@@ -56,10 +56,11 @@ typedef enum
 /*Timeout*/
 #define RX_TIMEOUT_VALUE              3000
 #define TX_TIMEOUT_VALUE              3000
-/* PING string*/
-#define PING "PING"
-/* PONG string*/
-#define PONG "PONG"
+/* Data sent by Master */
+#define DATA_MSG    "DATA"
+
+/* Response sent by Slave */
+#define ACK_MSG     "ACK!"
 /*Size of the payload to be sent*/
 /* Size must be greater of equal the PING and PONG*/
 #define MAX_APP_BUFFER_SIZE          255
@@ -155,7 +156,7 @@ void SubghzApp_Init(void)
 {
   /* USER CODE BEGIN SubghzApp_Init_1 */
 
-  APP_LOG(TS_OFF, VLEVEL_M, "\n\rPING PONG\n\r");
+  APP_LOG(TS_OFF, VLEVEL_M, "\n\rLORA DATA / ACK TEST\n\r");
   /* Get SubGHY_Phy APP version*/
   APP_LOG(TS_OFF, VLEVEL_M, "APPLICATION_VERSION: V%X.%X.%X\r\n",
           (uint8_t)(APP_VERSION_MAIN),
@@ -255,6 +256,7 @@ static void OnTxDone(void)
   APP_LOG(TS_ON, VLEVEL_L, "OnTxDone\n\r");
   /* Update the State of the FSM*/
   State = TX;
+  HAL_GPIO_TogglePin(Led_Signal_GPIO_Port, Led_Signal_Pin);
   /* Run PingPong process in background*/
   UTIL_SEQ_SetTask((1 << CFG_SEQ_Task_SubGHz_Phy_App_Process), CFG_SEQ_Prio_0);
   /* USER CODE END OnTxDone */
@@ -337,128 +339,244 @@ static void OnRxError(void)
 /* USER CODE BEGIN PrFD */
 static void PingPong_Process(void)
 {
-  Radio.Sleep();
+    Radio.Sleep();
 
-  switch (State)
-  {
-    case RX:
-
-      if (isMaster == true)
-      {
-        if (RxBufferSize > 0)
+    switch (State)
+    {
+        case RX:
         {
-          if (strncmp((const char *)BufferRx, PONG, sizeof(PONG) - 1) == 0)
-          {
-            UTIL_TIMER_Stop(&timerLed);
+            if (isMaster == true)
+            {
+                if (RxBufferSize > 0)
+                {
+                    /*
+                     * MASTER nhận ACK từ SLAVE
+                     */
+                    if (strncmp((const char *)BufferRx,
+                                ACK_MSG,
+                                sizeof(ACK_MSG) - 1) == 0)
+                    {
+                        UTIL_TIMER_Stop(&timerLed);
 
-            /* switch off green led */
-//            HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin, LED_OFF); /* LED_GREEN */
-            /* master toggles red led */
-//            HAL_GPIO_TogglePin(LED_RED_GPIO_Port, LED_RED_Pin); /* LED_RED */
+                        APP_LOG(TS_ON,
+                                VLEVEL_L,
+                                "Master RX: %s\r\n",
+                                ACK_MSG);
 
-            /* master toggles BLUE led */
-            HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin); /* LED_BLUE */
+                        /*
+                         * Delay trước khi gửi DATA tiếp theo
+                         */
+                        HAL_Delay(Radio.GetWakeupTime() +
+                                  RX_TIME_MARGIN);
 
-            /* Add delay between RX and TX */
-            HAL_Delay(Radio.GetWakeupTime() + RX_TIME_MARGIN);
-            /* master sends PING*/
-            APP_LOG(TS_ON, VLEVEL_L, "..."
-                    "PING"
-                    "\n\r");
-            APP_LOG(TS_ON, VLEVEL_L, "Master Tx start\n\r");
-            memcpy(BufferTx, PING, sizeof(PING) - 1);
-            Radio.Send(BufferTx, PAYLOAD_LEN);
-          }
-          else if (strncmp((const char *)BufferRx, PING, sizeof(PING) - 1) == 0)
-          {
-            /* A master already exists then become a slave */
-            isMaster = false;
-            APP_LOG(TS_ON, VLEVEL_L, "Slave Rx start\n\r");
-            Radio.Rx(RX_TIMEOUT_VALUE);
-          }
-          else /* valid reception but neither a PING or a PONG message */
-          {
-            /* Set device as master and start again */
-            isMaster = true;
-            APP_LOG(TS_ON, VLEVEL_L, "Master Rx start\n\r");
-            Radio.Rx(RX_TIMEOUT_VALUE);
-          }
+                        APP_LOG(TS_ON,
+                                VLEVEL_L,
+                                "Master TX: %s\r\n",
+                                DATA_MSG);
+
+                        memset(BufferTx,
+                               0,
+                               MAX_APP_BUFFER_SIZE);
+
+                        memcpy(BufferTx,
+                               DATA_MSG,
+                               sizeof(DATA_MSG) - 1);
+
+                        Radio.Send(BufferTx,
+                                   PAYLOAD_LEN);
+                    }
+
+                    /*
+                     * Nếu board đang nghĩ nó là MASTER
+                     * nhưng lại nhận DATA từ board kia,
+                     * thì board kia đã là MASTER.
+                     *
+                     * Board này chuyển thành SLAVE.
+                     */
+                    else if (strncmp((const char *)BufferRx,
+                                     DATA_MSG,
+                                     sizeof(DATA_MSG) - 1) == 0)
+                    {
+                        isMaster = false;
+
+                        APP_LOG(TS_ON,
+                                VLEVEL_L,
+                                "Become SLAVE, RX start\r\n");
+
+                        Radio.Rx(RX_TIMEOUT_VALUE);
+                    }
+
+                    /*
+                     * Packet lạ
+                     */
+                    else
+                    {
+                        isMaster = true;
+
+                        APP_LOG(TS_ON,
+                                VLEVEL_L,
+                                "Unknown packet, Master RX restart\r\n");
+
+                        Radio.Rx(RX_TIMEOUT_VALUE);
+                    }
+                }
+            }
+
+            /*
+             * SLAVE
+             */
+            else
+            {
+                if (RxBufferSize > 0)
+                {
+                    /*
+                     * SLAVE nhận DATA
+                     */
+                    if (strncmp((const char *)BufferRx,
+                                DATA_MSG,
+                                sizeof(DATA_MSG) - 1) == 0)
+                    {
+                        UTIL_TIMER_Stop(&timerLed);
+
+                        APP_LOG(TS_ON,
+                                VLEVEL_L,
+                                "Slave RX: %s\r\n",
+                                DATA_MSG);
+
+                        /*
+                         * Delay trước khi gửi ACK
+                         */
+                        HAL_Delay(Radio.GetWakeupTime() +
+                                  RX_TIME_MARGIN);
+
+                        APP_LOG(TS_ON,
+                                VLEVEL_L,
+                                "Slave TX: %s\r\n",
+                                ACK_MSG);
+
+                        memset(BufferTx,
+                               0,
+                               MAX_APP_BUFFER_SIZE);
+
+                        memcpy(BufferTx,
+                               ACK_MSG,
+                               sizeof(ACK_MSG) - 1);
+
+                        Radio.Send(BufferTx,
+                                   PAYLOAD_LEN);
+                    }
+
+                    /*
+                     * Nhận packet không đúng DATA
+                     */
+                    else
+                    {
+                        isMaster = true;
+
+                        APP_LOG(TS_ON,
+                                VLEVEL_L,
+                                "Unexpected packet, become MASTER\r\n");
+
+                        Radio.Rx(RX_TIMEOUT_VALUE);
+                    }
+                }
+            }
+
+            break;
         }
-      }
-      else
-      {
-        if (RxBufferSize > 0)
+
+
+        /*
+         * TX hoàn thành
+         * → quay lại RX
+         */
+        case TX:
         {
-          if (strncmp((const char *)BufferRx, PING, sizeof(PING) - 1) == 0)
-          {
-            UTIL_TIMER_Stop(&timerLed);
-            /* switch off red led */
-//            HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, LED_OFF); /* LED_RED */
-            /* slave toggles green led */
-//            HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin); /* LED_GREEN */
+            APP_LOG(TS_ON,
+                    VLEVEL_L,
+                    "RX start\r\n");
 
-            /* slave toggles BLUE led */
-            HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin); /* LED_BLUE */
-
-
-            /* Add delay between RX and TX */
-            HAL_Delay(Radio.GetWakeupTime() + RX_TIME_MARGIN);
-            /*slave sends PONG*/
-            APP_LOG(TS_ON, VLEVEL_L, "..."
-                    "PONG"
-                    "\n\r");
-            APP_LOG(TS_ON, VLEVEL_L, "Slave  Tx start\n\r");
-            memcpy(BufferTx, PONG, sizeof(PONG) - 1);
-            Radio.Send(BufferTx, PAYLOAD_LEN);
-          }
-          else /* valid reception but not a PING as expected */
-          {
-            /* Set device as master and start again */
-            isMaster = true;
-            APP_LOG(TS_ON, VLEVEL_L, "Master Rx start\n\r");
             Radio.Rx(RX_TIMEOUT_VALUE);
-          }
+
+            break;
         }
-      }
-      break;
-    case TX:
-      APP_LOG(TS_ON, VLEVEL_L, "Rx start\n\r");
-      Radio.Rx(RX_TIMEOUT_VALUE);
-      break;
-    case RX_TIMEOUT:
-    case RX_ERROR:
-      if (isMaster == true)
-      {
-        /* Send the next PING frame */
-        /* Add delay between RX and TX*/
-        /* add random_delay to force sync between boards after some trials*/
-        HAL_Delay(Radio.GetWakeupTime() + RX_TIME_MARGIN + random_delay);
-        APP_LOG(TS_ON, VLEVEL_L, "Master Tx start\n\r");
-        /* master sends PING*/
-        memcpy(BufferTx, PING, sizeof(PING) - 1);
-        Radio.Send(BufferTx, PAYLOAD_LEN);
-      }
-      else
-      {
-        APP_LOG(TS_ON, VLEVEL_L, "Slave Rx start\n\r");
-        Radio.Rx(RX_TIMEOUT_VALUE);
-      }
-      break;
-    case TX_TIMEOUT:
-      APP_LOG(TS_ON, VLEVEL_L, "Slave Rx start\n\r");
-      Radio.Rx(RX_TIMEOUT_VALUE);
-      break;
-    default:
-      break;
-  }
+
+
+        /*
+         * RX timeout hoặc RX error
+         */
+        case RX_TIMEOUT:
+        case RX_ERROR:
+        {
+            if (isMaster == true)
+            {
+                /*
+                 * Master không nhận được packet
+                 * → gửi DATA
+                 */
+                HAL_Delay(Radio.GetWakeupTime() +
+                          RX_TIME_MARGIN +
+                          random_delay);
+
+                APP_LOG(TS_ON,
+                        VLEVEL_L,
+                        "Master TX: %s\r\n",
+                        DATA_MSG);
+
+                memset(BufferTx,
+                       0,
+                       MAX_APP_BUFFER_SIZE);
+
+                memcpy(BufferTx,
+                       DATA_MSG,
+                       sizeof(DATA_MSG) - 1);
+
+                Radio.Send(BufferTx,
+                           PAYLOAD_LEN);
+            }
+            else
+            {
+                /*
+                 * Slave tiếp tục chờ DATA
+                 */
+                APP_LOG(TS_ON,
+                        VLEVEL_L,
+                        "Slave RX start\r\n");
+
+                Radio.Rx(RX_TIMEOUT_VALUE);
+            }
+
+            break;
+        }
+
+
+        /*
+         * TX timeout
+         */
+        case TX_TIMEOUT:
+        {
+            APP_LOG(TS_ON,
+                    VLEVEL_L,
+                    "TX timeout -> RX restart\r\n");
+
+            Radio.Rx(RX_TIMEOUT_VALUE);
+
+            break;
+        }
+
+
+        default:
+        {
+            break;
+        }
+    }
 }
-
 static void OnledEvent(void *context)
 {
   //HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin); /* LED_GREEN */
   //HAL_GPIO_TogglePin(LED_RED_GPIO_Port, LED_RED_Pin); /* LED_RED */
 
-  HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin); /* LED_BLUE */
+ // HAL_GPIO_TogglePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin); /* LED_BLUE */
 
   UTIL_TIMER_Start(&timerLed);
 }

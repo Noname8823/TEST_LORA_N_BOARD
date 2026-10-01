@@ -60,18 +60,26 @@ void Error_Handler(void);
 #define RTC_PREDIV_A ((1<<(15-RTC_N_PREDIV_S))-1)
 #define RTC_N_PREDIV_S 10
 #define RTC_PREDIV_S ((1<<RTC_N_PREDIV_S)-1)
-#define RF_SW_CTRL1_Pin GPIO_PIN_8
-#define RF_SW_CTRL1_GPIO_Port GPIOB
+#define IN_GPIO1_Pin GPIO_PIN_5
+#define IN_GPIO1_GPIO_Port GPIOB
+#define IN_GPIO2_Pin GPIO_PIN_6
+#define IN_GPIO2_GPIO_Port GPIOB
+#define IN_GPIO3_Pin GPIO_PIN_7
+#define IN_GPIO3_GPIO_Port GPIOB
+#define IN_GPIO4_Pin GPIO_PIN_8
+#define IN_GPIO4_GPIO_Port GPIOB
 #define TX2_Pin GPIO_PIN_2
 #define TX2_GPIO_Port GPIOA
 #define RX2_Pin GPIO_PIN_3
 #define RX2_GPIO_Port GPIOA
-#define LED_BLUE_Pin GPIO_PIN_8
-#define LED_BLUE_GPIO_Port GPIOA
+#define RS485_DR_Pin GPIO_PIN_4
+#define RS485_DR_GPIO_Port GPIOA
 #define FREQ_HIGH_Pin GPIO_PIN_12
 #define FREQ_HIGH_GPIO_Port GPIOB
-#define RF_SW_CTRL2_Pin GPIO_PIN_13
-#define RF_SW_CTRL2_GPIO_Port GPIOC
+#define Led_Signal_Pin GPIO_PIN_11
+#define Led_Signal_GPIO_Port GPIOA
+#define RF_SW_CTRL_Pin GPIO_PIN_13
+#define RF_SW_CTRL_GPIO_Port GPIOC
 
 /* USER CODE BEGIN Private defines */
 
