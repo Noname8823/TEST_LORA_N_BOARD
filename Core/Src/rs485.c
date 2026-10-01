@@ -1,598 +1,295 @@
+
 #include "rs485.h"
 
 #include "usart.h"
-#include "protocol.h"
-#include "app_inputs.h"
+#include "usart_if.h"
+
+#include "board_config.h"
+#include "subghz_phy_app.h"
 
 #include <string.h>
 
+#define UART_FIFO_SIZE 256U
 
-#define RS485_RX_BUFFER_SIZE    64U
-#define RS485_TX_BUFFER_SIZE    64U
+/* ================= DEBUG VARIABLES ================= */
 
+volatile uint32_t g_rs485_rx_bytes = 0U;
+volatile uint32_t g_rs485_messages = 0U;
+volatile uint32_t g_rs485_overflow = 0U;
+volatile uint32_t g_rs485_errors = 0U;
 
-/* =========================================================
- * Private variables
- * ========================================================= */
+volatile uint8_t g_rs485_last_byte = 0U;
 
-static uint8_t uart_rx_byte;
+#if (BOARD_ROLE == BOARD_1_TX)
 
+/* ================= UART FIFO ================= */
 
-/*
- * RX buffer is filled from UART interrupt.
- * When one complete packet is received:
- *
- *      rx_frame_ready = 1
- *
- * Main loop will process it in RS485_Task().
- */
-static volatile uint8_t  rx_frame_ready = 0U;
+static uint8_t uart_fifo[UART_FIFO_SIZE];
 
-static uint8_t rx_buffer[RS485_RX_BUFFER_SIZE];
+static volatile uint16_t fifo_head = 0U;
+static volatile uint16_t fifo_tail = 0U;
 
-static volatile uint16_t rx_index           = 0U;
-static volatile uint16_t rx_expected_length = 0U;
-static volatile uint16_t rx_frame_length    = 0U;
+/* ================= SERIAL MESSAGE ================= */
 
+static uint8_t serial_buffer[RS485_DATA_MAX];
 
-/* =========================================================
- * RX parser state
- * ========================================================= */
+static uint8_t serial_length = 0U;
+static uint8_t serial_ready = 0U;
 
-typedef enum
-{
-    RX_WAIT_SOF1 = 0,
-    RX_WAIT_SOF2,
-    RX_RECEIVING
-
-} RS485_RX_State;
-
-
-static volatile RS485_RX_State rx_state = RX_WAIT_SOF1;
-
+static uint32_t last_byte_time = 0U;
 
 /* =========================================================
- * Private functions
+ * UART RECEIVE CALLBACK
+ * Registered through existing usart_if.c
  * ========================================================= */
 
-static void RS485_ResetParser(void)
+static void RS485_RxChar(
+    uint8_t *data,
+    uint16_t size,
+    uint8_t error)
 {
-    rx_state = RX_WAIT_SOF1;
+    if (error != 0U)
+    {
+        g_rs485_errors++;
+        return;
+    }
 
-    rx_index = 0U;
-
-    rx_expected_length = 0U;
-}
-
-
-static void RS485_ParseByte(uint8_t data)
-{
-    /*
-     * One complete frame has already been received.
-     *
-     * Wait until RS485_Task() copies it before accepting
-     * another frame.
-     */
-    if (rx_frame_ready != 0U)
+    if ((data == NULL) || (size == 0U))
     {
         return;
     }
 
-
-    switch (rx_state)
+    for (uint16_t i = 0U; i < size; i++)
     {
-        /* -------------------------------------------------
-         * Wait first start byte: 0xAA
-         * ------------------------------------------------- */
-        case RX_WAIT_SOF1:
+        g_rs485_rx_bytes++;
+        g_rs485_last_byte = data[i];
+
+        uint16_t next =
+            (uint16_t)((fifo_head + 1U) % UART_FIFO_SIZE);
+
+        if (next == fifo_tail)
         {
-            if (data == PROTO_SOF1)
-            {
-                rx_buffer[0] = data;
-
-                rx_index = 1U;
-
-                rx_state = RX_WAIT_SOF2;
-            }
-
-            break;
+            g_rs485_overflow++;
+            continue;
         }
 
-
-        /* -------------------------------------------------
-         * Wait second start byte: 0x55
-         * ------------------------------------------------- */
-        case RX_WAIT_SOF2:
-        {
-            if (data == PROTO_SOF2)
-            {
-                rx_buffer[1] = data;
-
-                rx_index = 2U;
-
-                rx_expected_length = 0U;
-
-                rx_state = RX_RECEIVING;
-            }
-            /*
-             * Example:
-             *
-             * AA AA 55 ...
-             *
-             * Second AA can be treated as a new SOF1.
-             */
-            else if (data == PROTO_SOF1)
-            {
-                rx_buffer[0] = data;
-
-                rx_index = 1U;
-
-                rx_state = RX_WAIT_SOF2;
-            }
-            else
-            {
-                RS485_ResetParser();
-            }
-
-            break;
-        }
-
-
-        /* -------------------------------------------------
-         * Receive remaining packet
-         * ------------------------------------------------- */
-        case RX_RECEIVING:
-        {
-            /*
-             * Protect RX buffer overflow.
-             */
-            if (rx_index >= RS485_RX_BUFFER_SIZE)
-            {
-                RS485_ResetParser();
-
-                break;
-            }
-
-
-            rx_buffer[rx_index] = data;
-
-            rx_index++;
-
-
-            /*
-             * Packet:
-             *
-             *  AA 55 DST SRC CMD SEQ LEN DATA... CRC_L CRC_H
-             *
-             *  0  1   2   3   4   5   6
-             *
-             * When rx_index == 7, LEN has just been received.
-             */
-            if (rx_index == 7U)
-            {
-                uint8_t payload_len = rx_buffer[6];
-
-
-                /*
-                 * Reject invalid payload length.
-                 */
-                if (payload_len > PROTO_MAX_PAYLOAD)
-                {
-                    RS485_ResetParser();
-
-                    break;
-                }
-
-
-                /*
-                 * Total packet:
-                 *
-                 * SOF      = 2 bytes
-                 * header   = 5 bytes
-                 * payload  = LEN bytes
-                 * CRC      = 2 bytes
-                 *
-                 * Total = 9 + LEN
-                 */
-                rx_expected_length =
-                    (uint16_t)(9U + payload_len);
-
-
-                /*
-                 * Also protect our physical RX buffer.
-                 */
-                if (rx_expected_length > RS485_RX_BUFFER_SIZE)
-                {
-                    RS485_ResetParser();
-
-                    break;
-                }
-            }
-
-
-            /*
-             * Complete packet received.
-             */
-            if ((rx_expected_length > 0U) &&
-                (rx_index >= rx_expected_length))
-            {
-                rx_frame_length = rx_expected_length;
-
-                rx_frame_ready = 1U;
-
-                /*
-                 * Prepare parser state.
-                 *
-                 * But rx_buffer remains unchanged until
-                 * RS485_Task() copies the complete frame.
-                 */
-                rx_state = RX_WAIT_SOF1;
-
-                rx_index = 0U;
-
-                rx_expected_length = 0U;
-            }
-
-            break;
-        }
-
-
-        default:
-        {
-            RS485_ResetParser();
-
-            break;
-        }
+        uart_fifo[fifo_head] = data[i];
+        fifo_head = next;
     }
 }
 
+/* =========================================================
+ * READ FIFO
+ * ========================================================= */
+
+static uint8_t RS485_PopByte(uint8_t *data)
+{
+    if (fifo_head == fifo_tail)
+    {
+        return 0U;
+    }
+
+    *data = uart_fifo[fifo_tail];
+
+    fifo_tail =
+        (uint16_t)((fifo_tail + 1U) % UART_FIFO_SIZE);
+
+    return 1U;
+}
 
 /* =========================================================
- * Public functions
+ * SUBMIT SERIAL MESSAGE TO LORA
+ * ========================================================= */
+
+static uint8_t RS485_SubmitSerial(void)
+{
+    if (serial_length == 0U)
+    {
+        serial_ready = 0U;
+        return 1U;
+    }
+
+    if (SubghzApp_QueueSerial(
+            serial_buffer,
+            serial_length) == 0U)
+    {
+        /* LoRa pending slot is busy */
+        return 0U;
+    }
+
+    g_rs485_messages++;
+
+    serial_length = 0U;
+    serial_ready = 0U;
+
+    return 1U;
+}
+
+#endif
+
+/* =========================================================
+ * RS485 INITIALIZATION
  * ========================================================= */
 
 void RS485_Init(void)
 {
     /*
-     * MAX485 / RS485 direction:
-     *
-     * DIR = 0 -> RX
-     * DIR = 1 -> TX
-     *
-     * This assumes DE and /RE are controlled together.
+     * PA4 LOW:
+     * MAX3485 receiver enabled.
      */
-
     HAL_GPIO_WritePin(
         RS485_DR_GPIO_Port,
         RS485_DR_Pin,
         GPIO_PIN_RESET);
 
+#if (BOARD_ROLE == BOARD_1_TX)
 
-    /* Reset RX state */
-    rx_frame_ready = 0U;
+    fifo_head = 0U;
+    fifo_tail = 0U;
 
-    rx_frame_length = 0U;
+    serial_length = 0U;
+    serial_ready = 0U;
 
-    RS485_ResetParser();
-
+    last_byte_time = HAL_GetTick();
 
     /*
-     * Start receiving one byte using USART2 interrupt.
+     * Use the UART callback already provided
+     * by the original ST project.
      */
-    if (HAL_UART_Receive_IT(
-            &huart2,
-            &uart_rx_byte,
-            1U) != HAL_OK)
+    if (vcom_ReceiveInit(RS485_RxChar)
+        != UTIL_ADV_TRACE_OK)
     {
         Error_Handler();
     }
+
+#endif
 }
 
+/* =========================================================
+ * RS485 TRANSMIT
+ *
+ * Used by Board 2.
+ * ========================================================= */
 
-void RS485_Send(uint8_t *data, uint16_t length)
+uint8_t RS485_Send(
+    const uint8_t *data,
+    uint16_t length)
 {
     if ((data == NULL) || (length == 0U))
     {
-        return;
+        return 0U;
     }
 
-
-    /*
-     * Switch RS485 transceiver to transmit mode.
-     */
+    /* Enable MAX3485 transmitter */
     HAL_GPIO_WritePin(
         RS485_DR_GPIO_Port,
         RS485_DR_Pin,
         GPIO_PIN_SET);
 
-
-    /*
-     * Send packet through USART2.
-     */
-    if (HAL_UART_Transmit(
+    HAL_StatusTypeDef status =
+        HAL_UART_Transmit(
             &huart2,
-            data,
+            (uint8_t *)data,
             length,
-            1000U) != HAL_OK)
-    {
-        /*
-         * Return transceiver to RX even if TX failed.
-         */
-        HAL_GPIO_WritePin(
-            RS485_DR_GPIO_Port,
-            RS485_DR_Pin,
-            GPIO_PIN_RESET);
+            1000U);
 
-        return;
+    /* Wait for complete UART transmission */
+    if (status == HAL_OK)
+    {
+        while (__HAL_UART_GET_FLAG(
+                   &huart2,
+                   UART_FLAG_TC) == RESET)
+        {
+        }
     }
 
-
-    /*
-     * HAL_UART_Transmit() normally waits until TC,
-     * but keep this check to make absolutely sure
-     * the final stop bit has left the UART before
-     * disabling the RS485 transmitter.
-     */
-    while (__HAL_UART_GET_FLAG(
-               &huart2,
-               UART_FLAG_TC) == RESET)
-    {
-    }
-
-
-    /*
-     * Back to receive mode.
-     */
+    /* Return MAX3485 to RX mode */
     HAL_GPIO_WritePin(
         RS485_DR_GPIO_Port,
         RS485_DR_Pin,
         GPIO_PIN_RESET);
+
+    return (status == HAL_OK) ? 1U : 0U;
 }
 
+/* =========================================================
+ * RS485 MAIN TASK
+ * ========================================================= */
 
 void RS485_Task(void)
 {
-    ProtocolFrame frame;
+#if (BOARD_ROLE == BOARD_1_TX)
 
-    uint8_t local_rx_buffer[RS485_RX_BUFFER_SIZE];
-
-    uint8_t tx_buffer[RS485_TX_BUFFER_SIZE];
-
-    uint8_t payload[PROTO_MAX_PAYLOAD];
-
-    uint16_t length;
-
+    uint8_t data;
 
     /*
-     * No complete packet yet.
+     * Retry submission if previous message
+     * could not be queued.
      */
-    if (rx_frame_ready == 0U)
+    if (serial_ready != 0U)
     {
-        return;
-    }
-
-
-    /*
-     * While rx_frame_ready == 1,
-     * RS485_ParseByte() will not modify rx_buffer.
-     *
-     * Copy complete packet into local buffer first.
-     */
-    length = rx_frame_length;
-
-
-    if ((length == 0U) ||
-        (length > RS485_RX_BUFFER_SIZE))
-    {
-        rx_frame_ready = 0U;
-
-        return;
-    }
-
-
-    memcpy(
-        local_rx_buffer,
-        rx_buffer,
-        length);
-
-
-    /*
-     * Allow ISR to start receiving next packet.
-     *
-     * Processing below uses local_rx_buffer,
-     * therefore next packet cannot overwrite the
-     * packet currently being decoded.
-     */
-    rx_frame_ready = 0U;
-
-
-    /*
-     * Decode + CRC check.
-     */
-    if (Protocol_DecodeFrame(
-            local_rx_buffer,
-            length,
-            &frame) == 0U)
-    {
-        return;
-    }
-
-
-    /*
-     * Check device address.
-     *
-     * Ignore packet if it is not sent to STM32.
-     */
-    if (frame.dst != DEVICE_ADDR_STM32)
-    {
-        return;
-    }
-
-
-    /*
-     * Process command.
-     */
-    switch (frame.cmd)
-    {
-        /* =================================================
-         * PING command
-         * ================================================= */
-        case CMD_PING:
+        if (RS485_SubmitSerial() == 0U)
         {
-            /*
-             * Response payload:
-             *
-             * "OK"
-             */
+            return;
+        }
+    }
 
-            payload[0] = 'O';
-            payload[1] = 'K';
+    /*
+     * Read received UART data.
+     */
+    while (RS485_PopByte(&data) != 0U)
+    {
+        serial_buffer[serial_length] = data;
+        serial_length++;
 
+        last_byte_time = HAL_GetTick();
 
-            uint16_t tx_len =
-                Protocol_BuildFrame(
-                    tx_buffer,
+        /*
+         * Message completion:
+         * - Newline received.
+         * - Maximum message size reached.
+         */
+        if ((data == '\n') ||
+            (serial_length >= RS485_DATA_MAX))
+        {
+            serial_ready = 1U;
 
-                    /* Destination = original sender */
-                    frame.src,
-
-                    /* Source = STM32 */
-                    DEVICE_ADDR_STM32,
-
-                    CMD_PING_RESPONSE,
-
-                    /* Return same sequence number */
-                    frame.seq,
-
-                    payload,
-
-                    2U);
-
-
-            if (tx_len > 0U)
+            if (RS485_SubmitSerial() == 0U)
             {
-                RS485_Send(
-                    tx_buffer,
-                    tx_len);
+                return;
             }
-
-            break;
-        }
-
-
-        /* =================================================
-         * GET INPUTS command
-         * ================================================= */
-        case CMD_GET_INPUTS:
-        {
-            /*
-             * Payload byte:
-             *
-             * bit 0 = IN1
-             * bit 1 = IN2
-             * bit 2 = IN3
-             * bit 3 = IN4
-             *
-             * bit = 1 -> input ACTIVE
-             */
-
-            payload[0] = Inputs_GetMask();
-
-
-            uint16_t tx_len =
-                Protocol_BuildFrame(
-                    tx_buffer,
-
-                    /* Destination = Master */
-                    frame.src,
-
-                    /* Source = STM32 */
-                    DEVICE_ADDR_STM32,
-
-                    CMD_INPUTS_RESPONSE,
-
-                    frame.seq,
-
-                    payload,
-
-                    1U);
-
-
-            if (tx_len > 0U)
-            {
-                RS485_Send(
-                    tx_buffer,
-                    tx_len);
-            }
-
-            break;
-        }
-
-
-        default:
-        {
-            /*
-             * Unknown command.
-             * Ignore for now.
-             */
-
-            break;
         }
     }
+
+    /*
+     * Also support messages without newline.
+     *
+     * 25 ms without new UART bytes indicates
+     * the current message is complete.
+     */
+    if (serial_length > 0U)
+    {
+        uint32_t now = HAL_GetTick();
+
+        if ((uint32_t)(now - last_byte_time)
+            >= RS485_GAP_MS)
+        {
+            serial_ready = 1U;
+
+            (void)RS485_SubmitSerial();
+        }
+    }
+
+#else
+
+    /* Board 2 only forwards received LoRa data to RS485. */
+
+#endif
 }
-
 
 /* =========================================================
- * STM32 HAL UART callbacks
+ * UART ERROR RECOVERY
+ *
+ * usart_if.c owns HAL_UART_RxCpltCallback().
+ * This file only provides the UART error callback.
  * ========================================================= */
-
-void RS485_UART_RxCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART2)
-    {
-        RS485_ParseByte(uart_rx_byte);
-
-        HAL_UART_Receive_IT(
-            &huart2,
-            &uart_rx_byte,
-            1U);
-    }
-}
-
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART2)
-    {
-        /*
-         * Typical RS485/UART errors:
-         *
-         * ORE = overrun
-         * FE  = framing error
-         * NE  = noise error
-         */
-
-        RS485_ResetParser();
-
-        rx_frame_ready = 0U;
-
-        rx_frame_length = 0U;
-
-
-        /*
-         * Return transceiver to receive mode.
-         */
-        HAL_GPIO_WritePin(
-            RS485_DR_GPIO_Port,
-            RS485_DR_Pin,
-            GPIO_PIN_RESET);
-
-
-        /*
-         * Restart UART reception.
-         */
-        HAL_UART_Receive_IT(
-            &huart2,
-            &uart_rx_byte,
-            1U);
-    }
-}
