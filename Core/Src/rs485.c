@@ -1,167 +1,129 @@
 #include "rs485.h"
-#include "usart.h"
 #include "board_config.h"
 #include "subghz_phy_app.h"
-#include "wind_sensor.h"
+#include "usart.h"
 
-#define UART_FIFO_SIZE 256U
+/* UART RX FIFO */
+static volatile uint8_t fifo_data[RS485_FIFO_SIZE];
+static volatile uint32_t fifo_time[RS485_FIFO_SIZE];
 
-/* Debug counters */
-
-volatile uint32_t g_rs485_rx_bytes = 0U;
-volatile uint32_t g_rs485_messages = 0U;
-volatile uint32_t g_rs485_overflow = 0U;
-volatile uint32_t g_rs485_errors = 0U;
-
-volatile uint8_t g_rs485_last_byte = 0U;
-
-
-#if (BOARD_ROLE == BOARD_1_TX)
+static volatile uint16_t fifo_head;
+static volatile uint16_t fifo_tail;
 
 static uint8_t rx_byte;
+static volatile uint8_t tx_active;
 
+/* Pending UART data */
+static uint8_t chunk[RS485_DATA_MAX];
+static uint8_t chunk_len;
+static uint32_t last_chunk_byte_ms;
 
-#if (RS485_MODE == RS485_MODE_RAW)
+/* Debug counters */
+volatile uint32_t g_rs485_rx_bytes;
+volatile uint32_t g_rs485_messages;
+volatile uint32_t g_rs485_overflow;
+volatile uint32_t g_rs485_errors;
+volatile uint32_t g_rs485_rearm_fail;
+volatile uint32_t g_rs485_tx_errors;
 
-/* Legacy RAW mode */
+volatile uint8_t g_rs485_last_byte;
+volatile uint8_t g_rs485_raw_ring[32];
+volatile uint8_t g_rs485_raw_wr;
 
-static uint8_t uart_fifo[UART_FIFO_SIZE];
+/* =========================================
+ * UART RX REARM
+ * ========================================= */
 
-static volatile uint16_t fifo_head = 0U;
-static volatile uint16_t fifo_tail = 0U;
-
-static uint8_t serial_buffer[RS485_DATA_MAX];
-
-static uint8_t serial_length = 0U;
-static uint8_t serial_ready = 0U;
-
-static uint32_t last_byte_time = 0U;
-
-
-/* Push UART byte to FIFO */
-
-static void RS485_PushByte(uint8_t b)
+static void RS485_Rearm(void)
 {
-    uint16_t next =
-        (uint16_t)((fifo_head + 1U) % UART_FIFO_SIZE);
-
-    if (next == fifo_tail)
+    if (HAL_UART_Receive_IT(
+            &huart2,
+            &rx_byte,
+            1U) != HAL_OK)
     {
-        g_rs485_overflow++;
-        return;
+        g_rs485_rearm_fail++;
     }
-
-    uart_fifo[fifo_head] = b;
-
-    fifo_head = next;
 }
 
+/* =========================================
+ * INIT
+ * ========================================= */
 
-/* Pop byte from FIFO */
-
-static uint8_t RS485_PopByte(uint8_t *data)
+void RS485_Init(void)
 {
-    if (fifo_head == fifo_tail)
+    fifo_head = 0U;
+    fifo_tail = 0U;
+
+    chunk_len = 0U;
+    tx_active = 0U;
+
+    /* MAX3485 RX mode */
+    HAL_GPIO_WritePin(
+        RS485_DR_GPIO_Port,
+        RS485_DR_Pin,
+        GPIO_PIN_RESET
+    );
+
+    if (HAL_UART_Receive_IT(
+            &huart2,
+            &rx_byte,
+            1U) != HAL_OK)
     {
-        return 0U;
+        Error_Handler();
     }
-
-    *data = uart_fifo[fifo_tail];
-
-    fifo_tail =
-        (uint16_t)((fifo_tail + 1U) % UART_FIFO_SIZE);
-
-    return 1U;
 }
 
-
-/* Send RAW bytes to LoRa */
-
-static uint8_t RS485_SubmitSerial(void)
-{
-    if (serial_length == 0U)
-    {
-        serial_ready = 0U;
-
-        return 1U;
-    }
-
-    if (SubghzApp_QueueSerial(
-            serial_buffer,
-            serial_length) == 0U)
-    {
-        return 0U;
-    }
-
-    g_rs485_messages++;
-
-    serial_length = 0U;
-
-    serial_ready = 0U;
-
-    return 1U;
-}
-
-#endif /* RS485_MODE_RAW */
-
-
-/* =====================================================
- * UART RX CALLBACK
- * ===================================================== */
+/* =========================================
+ * UART RX INTERRUPT
+ * ========================================= */
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
+    uint16_t next;
+
     if (huart->Instance != USART2)
-    {
         return;
+
+    if (!tx_active)
+    {
+        g_rs485_rx_bytes++;
+        g_rs485_last_byte = rx_byte;
+
+        g_rs485_raw_ring[
+            g_rs485_raw_wr++ & 31U
+        ] = rx_byte;
+
+        next = (uint16_t)(
+            (fifo_head + 1U) &
+            (RS485_FIFO_SIZE - 1U)
+        );
+
+        if (next != fifo_tail)
+        {
+            fifo_data[fifo_head] = rx_byte;
+            fifo_time[fifo_head] = HAL_GetTick();
+
+            fifo_head = next;
+        }
+        else
+        {
+            g_rs485_overflow++;
+        }
     }
 
-    g_rs485_rx_bytes++;
-
-    g_rs485_last_byte = rx_byte;
-
-
-#if (RS485_MODE == RS485_MODE_RK100_02)
-
-    /* Pass received byte to Modbus parser */
-
-    Wind_OnByte(rx_byte);
-
-#else
-
-    RS485_PushByte(rx_byte);
-
-#endif
-
-    /* Continue receiving */
-
-    (void)HAL_UART_Receive_IT(
-        huart,
-        &rx_byte,
-        1U
-    );
+    RS485_Rearm();
 }
 
-
-/* =====================================================
- * UART ERROR CALLBACK
- * ===================================================== */
+/* =========================================
+ * UART ERROR
+ * ========================================= */
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance != USART2)
-    {
         return;
-    }
 
     g_rs485_errors++;
-
-
-#if (RS485_MODE == RS485_MODE_RK100_02)
-
-    Wind_OnUartError();
-
-#endif
 
     __HAL_UART_CLEAR_FLAG(
         huart,
@@ -171,69 +133,53 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         UART_CLEAR_PEF
     );
 
-    (void)HAL_UART_Receive_IT(
-        huart,
-        &rx_byte,
-        1U
-    );
+    RS485_Rearm();
 }
 
-#endif /* BOARD_1_TX */
+/* =========================================
+ * READ FIFO
+ * ========================================= */
 
-
-/* =====================================================
- * RS485 INIT
- * ===================================================== */
-
-void RS485_Init(void)
+uint8_t RS485_ReadByte(uint8_t *data)
 {
-    /*
-     * MAX3485:
-     *
-     * PA4 LOW  = RX mode
-     * PA4 HIGH = TX mode
-     */
-
-    HAL_GPIO_WritePin(
-        RS485_DR_GPIO_Port,
-        RS485_DR_Pin,
-        GPIO_PIN_RESET
-    );
-
-
-#if (BOARD_ROLE == BOARD_1_TX)
-
-#if (RS485_MODE == RS485_MODE_RAW)
-
-    fifo_head = 0U;
-
-    fifo_tail = 0U;
-
-    serial_length = 0U;
-
-    serial_ready = 0U;
-
-    last_byte_time = HAL_GetTick();
-
-#endif
-
-    /* Enable UART receive interrupt */
-
-    if (HAL_UART_Receive_IT(
-            &huart2,
-            &rx_byte,
-            1U) != HAL_OK)
+    if ((data == NULL) ||
+        (fifo_tail == fifo_head))
     {
-        Error_Handler();
+        return 0U;
     }
 
-#endif
+    *data = fifo_data[fifo_tail];
+
+    fifo_tail = (uint16_t)(
+        (fifo_tail + 1U) &
+        (RS485_FIFO_SIZE - 1U)
+    );
+
+    return 1U;
 }
 
+/* =========================================
+ * FLUSH FIFO
+ * ========================================= */
 
-/* =====================================================
- * RS485 TRANSMIT
- * ===================================================== */
+void RS485_FlushRx(void)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+
+    fifo_tail = fifo_head;
+    chunk_len = 0U;
+
+    if (!primask)
+    {
+        __enable_irq();
+    }
+}
+
+/* =========================================
+ * TRANSMIT RAW DATA TO RS485
+ * ========================================= */
 
 uint8_t RS485_Send(
     const uint8_t *data,
@@ -242,19 +188,16 @@ uint8_t RS485_Send(
     HAL_StatusTypeDef status;
 
     if ((data == NULL) || (length == 0U))
-    {
         return 0U;
-    }
 
-    /* Switch MAX3485 to TX mode */
+    tx_active = 1U;
 
+    /* Switch MAX3485 to TX */
     HAL_GPIO_WritePin(
         RS485_DR_GPIO_Port,
         RS485_DR_Pin,
         GPIO_PIN_SET
     );
-
-    /* Blocking UART transmit */
 
     status = HAL_UART_Transmit(
         &huart2,
@@ -263,12 +206,7 @@ uint8_t RS485_Send(
         1000U
     );
 
-    /*
-     * HAL_UART_Transmit waits until
-     * transmission is completed.
-     *
-     * Switch back to RX mode.
-     */
+    /* HAL_UART_Transmit waits for UART TC */
 
     HAL_GPIO_WritePin(
         RS485_DR_GPIO_Port,
@@ -276,68 +214,97 @@ uint8_t RS485_Send(
         GPIO_PIN_RESET
     );
 
+    tx_active = 0U;
+
+    if (status != HAL_OK)
+        g_rs485_tx_errors++;
+
     return (status == HAL_OK) ? 1U : 0U;
 }
 
+/* =========================================
+ * SUBMIT UART DATA TO LORA
+ * ========================================= */
 
-/* =====================================================
- * RS485 MAIN TASK
- * ===================================================== */
+static uint8_t RS485_SubmitChunk(void)
+{
+    if (chunk_len == 0U)
+        return 1U;
+
+    /* Preserve data if LoRa queue is occupied */
+    if (!SubghzApp_QueueSerial(
+            chunk,
+            chunk_len))
+    {
+        return 0U;
+    }
+
+    g_rs485_messages++;
+
+    chunk_len = 0U;
+
+    return 1U;
+}
+
+/* =========================================
+ * MAIN RS485 TASK
+ * ========================================= */
 
 void RS485_Task(void)
 {
+    uint8_t b;
+    uint32_t t;
 
-#if ((BOARD_ROLE == BOARD_1_TX) && \
-     (RS485_MODE == RS485_MODE_RAW))
-
-    uint8_t data;
-
-    if ((serial_ready != 0U) &&
-        (RS485_SubmitSerial() == 0U))
+    while (fifo_tail != fifo_head)
     {
-        return;
-    }
+        /*
+         * Peek before consuming.
+         * Do not lose data when LoRa is busy.
+         */
+        b = fifo_data[fifo_tail];
+        t = fifo_time[fifo_tail];
 
-    while (RS485_PopByte(&data) != 0U)
-    {
-        serial_buffer[serial_length++] = data;
-
-        last_byte_time = HAL_GetTick();
-
-        if ((data == '\n') ||
-            (serial_length >= RS485_DATA_MAX))
+        /*
+         * Detect inter-frame gap using the
+         * original byte reception timestamps.
+         */
+        if ((chunk_len != 0U) &&
+            ((uint32_t)(t - last_chunk_byte_ms)
+              >= RS485_GAP_MS))
         {
-            serial_ready = 1U;
-
-            if (RS485_SubmitSerial() == 0U)
-            {
+            if (!RS485_SubmitChunk())
                 return;
-            }
+        }
+
+        if (chunk_len == RS485_DATA_MAX)
+        {
+            if (!RS485_SubmitChunk())
+                return;
+        }
+
+        /* Consume UART byte */
+        fifo_tail = (uint16_t)(
+            (fifo_tail + 1U) &
+            (RS485_FIFO_SIZE - 1U)
+        );
+
+        chunk[chunk_len++] = b;
+        last_chunk_byte_ms = t;
+
+        /* Packet full */
+        if (chunk_len == RS485_DATA_MAX)
+        {
+            if (!RS485_SubmitChunk())
+                return;
         }
     }
 
-    /* Detect end of RAW message */
-
-    if ((serial_length > 0U) &&
-        ((uint32_t)(HAL_GetTick() - last_byte_time)
-          >= RS485_GAP_MS))
+    /* End of UART burst */
+    if ((chunk_len != 0U) &&
+        ((uint32_t)(
+            HAL_GetTick() - last_chunk_byte_ms
+        ) >= RS485_GAP_MS))
     {
-        serial_ready = 1U;
-
-        (void)RS485_SubmitSerial();
+        (void)RS485_SubmitChunk();
     }
-
-#else
-
-    /*
-     * Sensor mode:
-     *
-     * Wind_Task() handles polling,
-     * Modbus RX and LoRa submission.
-     *
-     * Board 2:
-     * LoRa receive handler forwards data.
-     */
-
-#endif
 }

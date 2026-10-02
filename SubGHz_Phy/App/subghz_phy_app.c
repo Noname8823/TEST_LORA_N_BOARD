@@ -9,36 +9,28 @@
 
 #include "main.h"
 #include "board_config.h"
-#include "app_inputs.h"
-#include "rs485.h"
 #include "protocol.h"
+#include "rs485.h"
 
 #include <string.h>
-#include <stdbool.h>
 
-/* =========================================================
- * CONFIGURATION
- * ========================================================= */
+/* Point-to-point: exactly two identical nodes */
+#define BRIDGE_DST             0xFFU
+#define BRIDGE_SRC             0x42U
 
-#define RX_TIMEOUT_VALUE      3000U
-#define TX_TIMEOUT_VALUE      3000U
+#define RX_TIMEOUT_VALUE       3000U
+#define TX_TIMEOUT_VALUE       3000U
 
-#define MAX_APP_BUFFER_SIZE   255U
+#define MAX_APP_BUFFER_SIZE    255U
+#define BRIDGE_DUP_WINDOW_MS   10000U
 
-#define RX_TIME_MARGIN        200U
-
-#define FSK_AFC_BANDWIDTH     83333U
-
-/* Board 1: number of resend attempts when ACK is lost */
-#define LINK_MAX_RETRY        3U
-
-#if (PAYLOAD_LEN > MAX_APP_BUFFER_SIZE)
-#error "Invalid LoRa payload size"
+#if (RS485_DATA_MAX > PROTO_MAX_PAYLOAD)
+#error "RS485 payload too large"
 #endif
 
-/* =========================================================
- * RADIO EVENTS
- * ========================================================= */
+/* =========================================
+ * EVENT DEFINITIONS
+ * ========================================= */
 
 typedef enum
 {
@@ -53,84 +45,94 @@ typedef enum
 
 } RadioEventType;
 
-/* =========================================================
- * PRIVATE VARIABLES
- * ========================================================= */
+typedef enum
+{
+    TX_KIND_NONE = 0,
+    TX_KIND_DATA,
+    TX_KIND_ACK
+
+} TxKind;
+
+/* =========================================
+ * RADIO VARIABLES
+ * ========================================= */
 
 static RadioEvents_t RadioEvents;
 
-static volatile RadioEventType radio_event = EVENT_NONE;
+static volatile RadioEventType radio_event;
 
-/* LoRa buffers */
 static uint8_t BufferRx[MAX_APP_BUFFER_SIZE];
 static uint8_t BufferTx[MAX_APP_BUFFER_SIZE];
 
-static uint16_t RxBufferSize = 0U;
+static uint16_t RxBufferSize;
 
-/* Radio information */
-int8_t RssiValue = 0;
-int8_t SnrValue = 0;
+static uint8_t radio_tx_active;
+static TxKind current_tx_kind;
 
-
-static volatile int16_t g_rx_rssi_dbm = 0;
-static volatile int8_t  g_rx_snr_db = 0;
-/* Radio state */
-static uint8_t radio_tx_active = 0U;
-
-/* LED PA11 timer */
 static UTIL_TIMER_Object_t timerLed;
+static UTIL_TIMER_Object_t timerBridge;
 
-/* =========================================================
- * DEBUG VARIABLES
- *
- * Can be viewed using STM32CubeIDE Expressions.
- * ========================================================= */
+static uint8_t bridge_timer_active;
 
-volatile uint32_t g_lora_tx_start = 0U;
-volatile uint32_t g_lora_tx_done = 0U;
-volatile uint32_t g_lora_rx_done = 0U;
-volatile uint32_t g_lora_tx_timeout = 0U;
-volatile uint32_t g_lora_rx_error = 0U;
+/* =========================================
+ * OUTGOING DATA
+ * ========================================= */
 
-volatile uint32_t g_lora_retry = 0U;
-volatile uint32_t g_lora_drop = 0U;
+static uint8_t outgoing[RS485_DATA_MAX];
 
-#if (BOARD_ROLE == BOARD_1_TX)
+static uint8_t outgoing_len;
+static uint8_t outgoing_valid;
 
-/* Heartbeat timer */
-static UTIL_TIMER_Object_t timerHeartbeat;
+static uint8_t outgoing_seq;
+static uint8_t next_seq;
 
-static volatile uint8_t heartbeat_due = 0U;
+static uint8_t send_attempts;
+static uint8_t waiting_ack;
 
-/* Pending RS485 data (kept until ACK is received) */
-static uint8_t serial_pending[RS485_DATA_MAX];
+static uint32_t ack_deadline_ms;
+static uint32_t next_data_ms;
 
-static uint8_t serial_pending_length = 0U;
-static uint8_t serial_pending_valid = 0U;
+/* =========================================
+ * ACK STATE
+ * ========================================= */
 
-/* Packet sequence */
-static uint8_t tx_sequence = 0U;
+static uint8_t ack_pending;
+static uint8_t ack_seq;
 
-static uint8_t waiting_sequence = 0U;
-static uint8_t waiting_ack = 0U;
+static uint32_t ack_due_ms;
 
-/* Retry handling */
-static uint8_t tx_carries_serial = 0U;  /* in-flight frame contains RS485 data */
-static uint8_t retry_count = 0U;
-static uint8_t resend_pending = 0U;     /* resend with the same sequence */
+/* Duplicate protection */
 
-#else
+static uint8_t last_rx_valid;
+static uint8_t last_rx_seq;
 
-/* Duplicate packet protection */
-static uint8_t last_rx_sequence = 0U;
+static uint32_t last_rx_ms;
 
-static uint8_t last_rx_sequence_valid = 0U;
+/* =========================================
+ * DEBUG
+ * ========================================= */
 
-#endif
+int8_t RssiValue;
+int8_t SnrValue;
 
-/* =========================================================
- * FUNCTION PROTOTYPES
- * ========================================================= */
+volatile uint32_t g_lora_tx_start;
+volatile uint32_t g_lora_tx_done;
+volatile uint32_t g_lora_rx_done;
+
+volatile uint32_t g_lora_tx_timeout;
+volatile uint32_t g_lora_rx_error;
+
+volatile uint32_t g_lora_retry;
+volatile uint32_t g_lora_drop;
+
+volatile uint32_t g_lora_ack_rx;
+volatile uint32_t g_lora_dup_rx;
+
+volatile uint32_t g_lora_uart_forward;
+
+/* =========================================
+ * PROTOTYPES
+ * ========================================= */
 
 static void OnTxDone(void);
 
@@ -138,7 +140,8 @@ static void OnRxDone(
     uint8_t *payload,
     uint16_t size,
     int16_t rssi,
-    int8_t LoraSnr_FskCfo);
+    int8_t LoraSnr_FskCfo
+);
 
 static void OnTxTimeout(void);
 static void OnRxTimeout(void);
@@ -146,67 +149,102 @@ static void OnRxError(void);
 
 static void LoRa_Process(void);
 
-static void LoRa_StartTx(uint16_t length);
-static void LoRa_StartRx(void);
+/* =========================================
+ * BRIDGE TIMER
+ * ========================================= */
 
-static void OnledEvent(void *context);
-
-#if (BOARD_ROLE == BOARD_1_TX)
-
-static void OnHeartbeatEvent(void *context);
-
-static void Board1_TransmitPending(void);
-static void Board1_ProcessReceived(void);
-
-#else
-
-static void Board2_ProcessReceived(void);
-
-#endif
-
-/* =========================================================
- * PA11 LED CONTROL
- *
- * HIGH = LED ON
- * LOW  = LED OFF
- *
- * Never use HAL_GPIO_TogglePin() here.
- * ========================================================= */
-
-static void LED_TxOn(void)
-{
-    HAL_GPIO_WritePin(
-        Led_Signal_GPIO_Port,
-        Led_Signal_Pin,
-        GPIO_PIN_SET);
-}
-
-static void LED_TxOff(void)
-{
-    HAL_GPIO_WritePin(
-        Led_Signal_GPIO_Port,
-        Led_Signal_Pin,
-        GPIO_PIN_RESET);
-}
-
-/* =========================================================
- * LED TIMER CALLBACK
- *
- * Automatically turn PA11 OFF after TX indication.
- * ========================================================= */
-
-static void OnledEvent(void *context)
+static void Bridge_Tick(void *context)
 {
     (void)context;
 
-    LED_TxOff();
+    UTIL_SEQ_SetTask(
+        (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
+        CFG_SEQ_Prio_0
+    );
 }
 
-/* =========================================================
- * START LORA TRANSMISSION
- * ========================================================= */
+static void Bridge_StartTick(void)
+{
+    if (!bridge_timer_active)
+    {
+        bridge_timer_active = 1U;
 
-static void LoRa_StartTx(uint16_t length)
+        UTIL_TIMER_Start(&timerBridge);
+    }
+}
+
+/* =========================================
+ * TIME CHECK
+ * ========================================= */
+
+static uint8_t TimeReached(uint32_t deadline)
+{
+    return (
+        (int32_t)(HAL_GetTick() - deadline) >= 0
+    ) ? 1U : 0U;
+}
+
+/* =========================================
+ * RETRY BACKOFF
+ * ========================================= */
+
+static uint32_t RetryJitter(void)
+{
+    /*
+     * Use chip UID to reduce the chance
+     * of both boards starting TX together.
+     *
+     * This does not guarantee collision-free TX.
+     */
+
+    uint32_t mix =
+        HAL_GetUIDw0() ^
+        HAL_GetUIDw1() ^
+        HAL_GetUIDw2();
+
+    mix ^= HAL_GetTick() +
+        ((uint32_t)send_attempts * 0x9E3779B9UL);
+
+    mix ^= mix >> 16;
+
+    mix *= 0x7FEB352DUL;
+
+    mix ^= mix >> 15;
+
+    return 35U + (mix % 180U);
+}
+
+/* =========================================
+ * PA11 TX LED
+ * ========================================= */
+
+static void LED_Off(void *context)
+{
+    (void)context;
+
+    HAL_GPIO_WritePin(
+        Led_Signal_GPIO_Port,
+        Led_Signal_Pin,
+        GPIO_PIN_RESET
+    );
+}
+
+/* =========================================
+ * START RX
+ * ========================================= */
+
+static void LoRa_StartRx(void)
+{
+    Radio.Rx(RX_TIMEOUT_VALUE);
+}
+
+/* =========================================
+ * START TX
+ * ========================================= */
+
+static void LoRa_StartTx(
+    uint16_t length,
+    TxKind kind)
 {
     if ((length == 0U) ||
         (length > MAX_APP_BUFFER_SIZE))
@@ -214,159 +252,182 @@ static void LoRa_StartTx(uint16_t length)
         return;
     }
 
-    /* Stop previous LED OFF timer */
     UTIL_TIMER_Stop(&timerLed);
 
-    /* Stop radio RX */
     Radio.Sleep();
 
     radio_tx_active = 1U;
+    current_tx_kind = kind;
 
-    /* Debug */
     g_lora_tx_start++;
 
-    /* PA11 HIGH: LED ON when LoRa transmission starts */
-    LED_TxOn();
+    /* PA11 HIGH during TX */
+    HAL_GPIO_WritePin(
+        Led_Signal_GPIO_Port,
+        Led_Signal_Pin,
+        GPIO_PIN_SET
+    );
 
-    /* Start sending packet */
     Radio.Send(BufferTx, length);
 }
 
-/* =========================================================
- * START LORA RECEPTION
- * ========================================================= */
+/* =========================================
+ * RETRY OR DROP
+ * ========================================= */
 
-static void LoRa_StartRx(void)
+static void RetryOrDrop(void)
 {
-    Radio.Rx(RX_TIMEOUT_VALUE);
+    waiting_ack = 0U;
+
+    if (send_attempts >= BRIDGE_MAX_ATTEMPTS)
+    {
+        g_lora_drop++;
+
+        outgoing_valid = 0U;
+        outgoing_len = 0U;
+
+        send_attempts = 0U;
+    }
+    else
+    {
+        g_lora_retry++;
+
+        next_data_ms =
+            HAL_GetTick() + RetryJitter();
+    }
 }
 
-/* =========================================================
- * QUEUE RS485 DATA
- *
- * Called from RS485_Task() on Board 1.
- * ========================================================= */
+/* =========================================
+ * QUEUE RAW RS485 DATA
+ * ========================================= */
 
 uint8_t SubghzApp_QueueSerial(
     const uint8_t *data,
     uint8_t length)
 {
-#if (BOARD_ROLE == BOARD_1_TX)
-
     if ((data == NULL) ||
         (length == 0U) ||
-        (length > RS485_DATA_MAX))
+        (length > RS485_DATA_MAX) ||
+        outgoing_valid)
     {
         return 0U;
     }
 
-    /* Only one pending serial message */
-    if (serial_pending_valid != 0U)
-    {
-        return 0U;
-    }
+    memcpy(outgoing, data, length);
 
-    memcpy(
-        serial_pending,
-        data,
-        length);
+    outgoing_len = length;
+    outgoing_valid = 1U;
 
-    serial_pending_length = length;
+    outgoing_seq = next_seq++;
 
-    serial_pending_valid = 1U;
+    send_attempts = 0U;
 
-    /* Wake LoRa processing task */
+    /* Initial backoff */
+    next_data_ms =
+        HAL_GetTick() + RetryJitter();
+
+    Bridge_StartTick();
+
     UTIL_SEQ_SetTask(
         (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
-        CFG_SEQ_Prio_0);
+        CFG_SEQ_Prio_0
+    );
 
     return 1U;
-
-#else
-
-    (void)data;
-    (void)length;
-
-    return 0U;
-
-#endif
 }
 
-/* =========================================================
- * LORA INITIALIZATION
- * ========================================================= */
+/* =========================================
+ * BRIDGE PERIODIC TASK
+ * ========================================= */
+
+void SubghzApp_Task(void)
+{
+    uint8_t wake = 0U;
+
+    if (ack_pending &&
+        TimeReached(ack_due_ms))
+    {
+        wake = 1U;
+    }
+
+    if (waiting_ack &&
+        TimeReached(ack_deadline_ms))
+    {
+        wake = 1U;
+    }
+
+    if (outgoing_valid &&
+        !waiting_ack &&
+        TimeReached(next_data_ms))
+    {
+        wake = 1U;
+    }
+
+    if (wake)
+    {
+        UTIL_SEQ_SetTask(
+            (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
+            CFG_SEQ_Prio_0
+        );
+    }
+}
+
+/* =========================================
+ * LORA INIT
+ * ========================================= */
 
 void SubghzApp_Init(void)
 {
-    memset(
-        BufferRx,
-        0,
-        sizeof(BufferRx));
-
-    memset(
-        BufferTx,
-        0,
-        sizeof(BufferTx));
+    memset(BufferRx, 0, sizeof(BufferRx));
+    memset(BufferTx, 0, sizeof(BufferTx));
 
     RxBufferSize = 0U;
 
     radio_event = EVENT_NONE;
 
     radio_tx_active = 0U;
+    current_tx_kind = TX_KIND_NONE;
 
-    /* Always start with PA11 LOW */
-    LED_TxOff();
+    bridge_timer_active = 0U;
 
-    /* LED timer: one-shot, started only after TX done */
+    outgoing_valid = 0U;
+    outgoing_len = 0U;
+
+    next_seq = 0U;
+
+    waiting_ack = 0U;
+    send_attempts = 0U;
+
+    ack_pending = 0U;
+    last_rx_valid = 0U;
+
+    HAL_GPIO_WritePin(
+        Led_Signal_GPIO_Port,
+        Led_Signal_Pin,
+        GPIO_PIN_RESET
+    );
+
     UTIL_TIMER_Create(
         &timerLed,
         LED_TX_HOLD_MS,
         UTIL_TIMER_ONESHOT,
-        OnledEvent,
-        NULL);
+        LED_Off,
+        NULL
+    );
 
-#if (BOARD_ROLE == BOARD_1_TX)
-
-    /* =====================================================
-     * BOARD 1 INITIALIZATION
-     * ===================================================== */
-
-    heartbeat_due = 0U;
-
-    serial_pending_valid = 0U;
-    serial_pending_length = 0U;
-
-    tx_sequence = 0U;
-
-    waiting_ack = 0U;
-    waiting_sequence = 0U;
-
-    tx_carries_serial = 0U;
-    retry_count = 0U;
-    resend_pending = 0U;
-
+    /*
+     * Keeps ACK and retry deadlines alive
+     * while STM32 sequencer is idle.
+     */
     UTIL_TIMER_Create(
-        &timerHeartbeat,
-        HEARTBEAT_PERIOD_MS,
+        &timerBridge,
+        10U,
         UTIL_TIMER_PERIODIC,
-        OnHeartbeatEvent,
-        NULL);
+        Bridge_Tick,
+        NULL
+    );
 
-#else
-
-    /* =====================================================
-     * BOARD 2 INITIALIZATION
-     * ===================================================== */
-
-    last_rx_sequence = 0U;
-    last_rx_sequence_valid = 0U;
-
-#endif
-
-    /* =====================================================
-     * ORIGINAL RADIO CALLBACKS
-     * ===================================================== */
-
+    /* Radio callbacks */
     RadioEvents.TxDone = OnTxDone;
     RadioEvents.RxDone = OnRxDone;
 
@@ -377,10 +438,6 @@ void SubghzApp_Init(void)
     Radio.Init(&RadioEvents);
 
     Radio.SetChannel(RF_FREQUENCY);
-
-    /* =====================================================
-     * ORIGINAL LORA / FSK CONFIGURATION
-     * ===================================================== */
 
 #if ((USE_MODEM_LORA == 1) && (USE_MODEM_FSK == 0))
 
@@ -397,7 +454,8 @@ void SubghzApp_Init(void)
         0,
         0,
         LORA_IQ_INVERSION_ON,
-        TX_TIMEOUT_VALUE);
+        TX_TIMEOUT_VALUE
+    );
 
     Radio.SetRxConfig(
         MODEM_LORA,
@@ -413,78 +471,31 @@ void SubghzApp_Init(void)
         0,
         0,
         LORA_IQ_INVERSION_ON,
-        true);
+        true
+    );
 
     Radio.SetMaxPayloadLength(
         MODEM_LORA,
-        MAX_APP_BUFFER_SIZE);
-
-#elif ((USE_MODEM_LORA == 0) && (USE_MODEM_FSK == 1))
-
-    Radio.SetTxConfig(
-        MODEM_FSK,
-        TX_OUTPUT_POWER,
-        FSK_FDEV,
-        0,
-        FSK_DATARATE,
-        0,
-        FSK_PREAMBLE_LENGTH,
-        FSK_FIX_LENGTH_PAYLOAD_ON,
-        true,
-        0,
-        0,
-        0,
-        TX_TIMEOUT_VALUE);
-
-    Radio.SetRxConfig(
-        MODEM_FSK,
-        FSK_BANDWIDTH,
-        FSK_DATARATE,
-        0,
-        FSK_AFC_BANDWIDTH,
-        FSK_PREAMBLE_LENGTH,
-        0,
-        FSK_FIX_LENGTH_PAYLOAD_ON,
-        0,
-        true,
-        0,
-        0,
-        false,
-        true);
-
-    Radio.SetMaxPayloadLength(
-        MODEM_FSK,
-        MAX_APP_BUFFER_SIZE);
+        MAX_APP_BUFFER_SIZE
+    );
 
 #else
-
-#error "Invalid modem configuration"
-
+#error "This bridge implementation is LoRa-only"
 #endif
-
-    /* =====================================================
-     * REGISTER LORA TASK
-     * ===================================================== */
 
     UTIL_SEQ_RegTask(
         (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
         UTIL_SEQ_RFU,
-        LoRa_Process);
+        LoRa_Process
+    );
 
-#if (BOARD_ROLE == BOARD_1_TX)
-
-    /* Start periodic heartbeat */
-    UTIL_TIMER_Start(&timerHeartbeat);
-
-#endif
-
-    /* Both boards start in RX mode */
+    /* Both boards start in RX */
     LoRa_StartRx();
 }
 
-/* =========================================================
- * RADIO TX DONE CALLBACK
- * ========================================================= */
+/* =========================================
+ * RADIO CALLBACKS
+ * ========================================= */
 
 static void OnTxDone(void)
 {
@@ -494,12 +505,9 @@ static void OnTxDone(void)
 
     UTIL_SEQ_SetTask(
         (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
-        CFG_SEQ_Prio_0);
+        CFG_SEQ_Prio_0
+    );
 }
-
-/* =========================================================
- * RADIO RX DONE CALLBACK
- * ========================================================= */
 
 static void OnRxDone(
     uint8_t *payload,
@@ -507,32 +515,21 @@ static void OnRxDone(
     int16_t rssi,
     int8_t LoraSnr_FskCfo)
 {
-	g_rx_rssi_dbm = rssi;
-	g_rx_snr_db = LoraSnr_FskCfo;
-    g_lora_rx_done++;
-
     RssiValue = (int8_t)rssi;
-
-#if ((USE_MODEM_LORA == 1) && (USE_MODEM_FSK == 0))
     SnrValue = LoraSnr_FskCfo;
-#else
-    SnrValue = 0;
-#endif
+
+    g_lora_rx_done++;
 
     if ((payload == NULL) ||
         (size == 0U) ||
-        (size > MAX_APP_BUFFER_SIZE))
+        (size > sizeof(BufferRx)))
     {
         RxBufferSize = 0U;
-
         radio_event = EVENT_RX_ERROR;
     }
     else
     {
-        memcpy(
-            BufferRx,
-            payload,
-            size);
+        memcpy(BufferRx, payload, size);
 
         RxBufferSize = size;
 
@@ -541,12 +538,9 @@ static void OnRxDone(
 
     UTIL_SEQ_SetTask(
         (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
-        CFG_SEQ_Prio_0);
+        CFG_SEQ_Prio_0
+    );
 }
-
-/* =========================================================
- * RADIO TX TIMEOUT CALLBACK
- * ========================================================= */
 
 static void OnTxTimeout(void)
 {
@@ -556,12 +550,9 @@ static void OnTxTimeout(void)
 
     UTIL_SEQ_SetTask(
         (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
-        CFG_SEQ_Prio_0);
+        CFG_SEQ_Prio_0
+    );
 }
-
-/* =========================================================
- * RADIO RX TIMEOUT CALLBACK
- * ========================================================= */
 
 static void OnRxTimeout(void)
 {
@@ -569,12 +560,9 @@ static void OnRxTimeout(void)
 
     UTIL_SEQ_SetTask(
         (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
-        CFG_SEQ_Prio_0);
+        CFG_SEQ_Prio_0
+    );
 }
-
-/* =========================================================
- * RADIO RX ERROR CALLBACK
- * ========================================================= */
 
 static void OnRxError(void)
 {
@@ -584,478 +572,273 @@ static void OnRxError(void)
 
     UTIL_SEQ_SetTask(
         (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
-        CFG_SEQ_Prio_0);
+        CFG_SEQ_Prio_0
+    );
 }
 
-/* =========================================================
- * BOARD 1 - HEARTBEAT TIMER
- * ========================================================= */
+/* =========================================
+ * PROCESS RECEIVED LORA DATA
+ * ========================================= */
 
-#if (BOARD_ROLE == BOARD_1_TX)
-
-static void OnHeartbeatEvent(void *context)
+static void ProcessReceived(void)
 {
-    (void)context;
+    ProtocolFrame frame;
 
-    heartbeat_due = 1U;
+    uint32_t now = HAL_GetTick();
 
-    UTIL_SEQ_SetTask(
-        (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
-        CFG_SEQ_Prio_0);
-}
-
-/* =========================================================
- * BOARD 1 - BUILD AND SEND DATA PACKET
- *
- * Payload:
- * [0]    = GPIO mask
- * [1...] = Received RS485 data
- *
- * The RS485 data stays in serial_pending until the ACK
- * arrives (see Board1_ProcessReceived), so it can be
- * resent with the same sequence number after a timeout.
- * ========================================================= */
-
-static void Board1_TransmitPending(void)
-{
-    uint8_t payload[PROTO_MAX_PAYLOAD];
-
-    uint8_t payload_length = 1U;
-
-    uint8_t sequence;
-
-    uint16_t tx_length;
-
-    /* Wait until previous transmission has finished */
-    if ((radio_tx_active != 0U) ||
-        (waiting_ack != 0U))
+    if (!Protocol_DecodeFrame(
+            BufferRx,
+            RxBufferSize,
+            &frame))
     {
         return;
     }
 
-    /* No serial data and no heartbeat */
-    if ((serial_pending_valid == 0U) &&
-        (heartbeat_due == 0U))
+    /* Accept only paired bridge packets */
+    if ((frame.dst != BRIDGE_DST) ||
+        (frame.src != BRIDGE_SRC))
     {
         return;
     }
 
-    memset(
-        payload,
-        0,
-        sizeof(payload));
+    /* -------------------------------------
+     * Received ACK
+     * ------------------------------------- */
 
-    /* Read four opto states */
-    payload[0] = Inputs_GetMask() & 0x0FU;
-
-    /* If RS485 data exists: append it after GPIO mask */
-    if (serial_pending_valid != 0U)
+    if (frame.cmd == CMD_LINK_ACK)
     {
-        payload_length =
-            (uint8_t)(1U + serial_pending_length);
+        if ((frame.len == 0U) &&
+            waiting_ack &&
+            outgoing_valid &&
+            (frame.seq == outgoing_seq))
+        {
+            waiting_ack = 0U;
 
-        memcpy(
-            &payload[1],
-            serial_pending,
-            serial_pending_length);
+            outgoing_valid = 0U;
+            outgoing_len = 0U;
+
+            send_attempts = 0U;
+
+            g_lora_ack_rx++;
+        }
+
+        return;
     }
 
-    /* Resend uses the same sequence so Board 2 can drop duplicates */
-    if (resend_pending != 0U)
+    /* Accept only DATA packets */
+    if ((frame.cmd != CMD_LINK_DATA) ||
+        (frame.len == 0U))
     {
-        sequence = waiting_sequence;
-        resend_pending = 0U;
+        return;
+    }
+
+    /* -------------------------------------
+     * Duplicate detection
+     * ------------------------------------- */
+
+    if (last_rx_valid &&
+        (last_rx_seq == frame.seq) &&
+        ((uint32_t)(now - last_rx_ms)
+          < BRIDGE_DUP_WINDOW_MS))
+    {
+        g_lora_dup_rx++;
     }
     else
     {
-        sequence = tx_sequence++;
+        /*
+         * Output ONLY raw payload bytes.
+         *
+         * Never forward:
+         * - AA 55
+         * - LoRa packet header
+         * - Internal CRC
+         * - ACK
+         * - RF statistics
+         */
+
+        if (!RS485_Send(
+                frame.payload,
+                frame.len))
+        {
+            /* Failed UART transmission: do not ACK */
+            return;
+        }
+
+        last_rx_seq = frame.seq;
+        last_rx_ms = HAL_GetTick();
+
+        last_rx_valid = 1U;
+
+        g_lora_uart_forward++;
     }
 
-    /* Build AA 55 protocol frame */
-    tx_length = Protocol_BuildFrame(
+    /* -------------------------------------
+     * Schedule ACK
+     * ------------------------------------- */
+
+    ack_seq = frame.seq;
+    ack_pending = 1U;
+
+    ack_due_ms =
+        HAL_GetTick() + BRIDGE_ACK_DELAY_MS;
+
+    Bridge_StartTick();
+
+    if (waiting_ack)
+    {
+        ack_deadline_ms =
+            HAL_GetTick() + BRIDGE_ACK_TIMEOUT_MS;
+    }
+}
+
+/* =========================================
+ * TRANSMISSION STATE MACHINE
+ * ========================================= */
+
+static void Bridge_Service(void)
+{
+    uint16_t length;
+
+    if (radio_tx_active)
+        return;
+
+    /*
+     * ACK has priority over new UART traffic.
+     */
+    if (ack_pending)
+    {
+        if (!TimeReached(ack_due_ms))
+            return;
+
+        length = Protocol_BuildFrame(
+            BufferTx,
+            BRIDGE_DST,
+            BRIDGE_SRC,
+            CMD_LINK_ACK,
+            ack_seq,
+            NULL,
+            0U
+        );
+
+        if (!length)
+            return;
+
+        ack_pending = 0U;
+
+        LoRa_StartTx(length, TX_KIND_ACK);
+
+        return;
+    }
+
+    /* -------------------------------------
+     * ACK timeout
+     * ------------------------------------- */
+
+    if (waiting_ack)
+    {
+        if (!TimeReached(ack_deadline_ms))
+            return;
+
+        RetryOrDrop();
+    }
+
+    /* -------------------------------------
+     * No outgoing data or still waiting
+     * ------------------------------------- */
+
+    if (!outgoing_valid ||
+        waiting_ack ||
+        !TimeReached(next_data_ms))
+    {
+        return;
+    }
+
+    /* -------------------------------------
+     * Build internal DATA packet
+     * ------------------------------------- */
+
+    length = Protocol_BuildFrame(
         BufferTx,
-
-        DEVICE_ADDR_BOARD2,
-        DEVICE_ADDR_BOARD1,
-
+        BRIDGE_DST,
+        BRIDGE_SRC,
         CMD_LINK_DATA,
+        outgoing_seq,
+        outgoing,
+        outgoing_len
+    );
 
-        sequence,
-
-        payload,
-        payload_length);
-
-    if (tx_length == 0U)
+    if (!length)
     {
+        g_lora_drop++;
+
+        outgoing_valid = 0U;
+
         return;
     }
 
-    waiting_sequence = sequence;
+    send_attempts++;
 
-    /* Remember whether this frame carries RS485 data */
-    tx_carries_serial =
-        (serial_pending_valid != 0U) ? 1U : 0U;
-
-    heartbeat_due = 0U;
-
-    /* PA11 turns ON inside this function */
-    LoRa_StartTx(tx_length);
+    LoRa_StartTx(length, TX_KIND_DATA);
 }
 
-/* =========================================================
- * BOARD 1 - PROCESS ACK
- * ========================================================= */
-
-static void Board1_ProcessReceived(void)
-{
-    ProtocolFrame frame;
-
-    if (Protocol_DecodeFrame(
-            BufferRx,
-            RxBufferSize,
-            &frame) == 0U)
-    {
-        return;
-    }
-
-    if ((waiting_ack != 0U) &&
-        (frame.dst == DEVICE_ADDR_BOARD1) &&
-        (frame.src == DEVICE_ADDR_BOARD2) &&
-        (frame.cmd == CMD_LINK_ACK) &&
-        (frame.len == 0U) &&
-        (frame.seq == waiting_sequence))
-    {
-        /* ACK received */
-        waiting_ack = 0U;
-
-        /* Release RS485 data only if this frame carried it */
-        if (tx_carries_serial != 0U)
-        {
-            serial_pending_valid = 0U;
-            serial_pending_length = 0U;
-
-            tx_carries_serial = 0U;
-        }
-
-        retry_count = 0U;
-    }
-}
-
-#endif
-
-/* =========================================================
- * BOARD 2 - PROCESS RECEIVED DATA
- * ========================================================= */
-
-#if (BOARD_ROLE == BOARD_2_RX)
-
-
-static void Board2_ProcessReceived(void)
-{
-    ProtocolFrame frame;
-
-    uint16_t ack_length;
-    uint16_t rf_length;
-
-    /* RF frame: 9-byte overhead + 3-byte payload */
-    uint8_t rf_packet[18];
-    uint8_t rf_payload[9];
-
-    int16_t rssi;
-    uint32_t freq_hz;
-    /* =====================================================
-     * 1. Decode received LoRa packet and check CRC
-     * ===================================================== */
-
-    if (Protocol_DecodeFrame(
-            BufferRx,
-            RxBufferSize,
-            &frame) == 0U)
-    {
-        LoRa_StartRx();
-        return;
-    }
-
-    /* Accept only DATA from Board 1 */
-    if ((frame.dst != DEVICE_ADDR_BOARD2) ||
-        (frame.src != DEVICE_ADDR_BOARD1) ||
-        (frame.cmd != CMD_LINK_DATA) ||
-        (frame.len < 1U))
-    {
-        LoRa_StartRx();
-        return;
-    }
-
-    /* =====================================================
-     * 2. Forward valid packet to RS485
-     *
-     * Duplicate packets are not forwarded twice.
-     * ===================================================== */
-
-    if ((last_rx_sequence_valid == 0U) ||
-        (last_rx_sequence != frame.seq))
-    {
-        /* =================================================
-         * 3. Build RF signal information
-         *
-         * RF Payload:
-         *
-         * Byte 0: RSSI LOW
-         * Byte 1: RSSI HIGH
-         * Byte 2: SNR
-         *
-         * Command = 0x21
-         * Sequence = Same as DATA packet
-         * ================================================= */
-
-
-    	/* =========================================
-    	 * BUILD RF INFORMATION
-    	 * ========================================= */
-
-    	rssi = g_rx_rssi_dbm;
-    	freq_hz = (uint32_t)RF_FREQUENCY;
-
-    	/* Byte 0-1: RSSI (signed int16) */
-    	rf_payload[0] = (uint8_t)((uint16_t)rssi & 0xFFU);
-    	rf_payload[1] = (uint8_t)(((uint16_t)rssi >> 8U) & 0xFFU);
-
-    	/* Byte 2: SNR (signed int8) */
-    	rf_payload[2] = (uint8_t)g_rx_snr_db;
-
-    	/* Byte 3-6: Frequency in Hz, Little Endian */
-    	rf_payload[3] = (uint8_t)(freq_hz & 0xFFU);
-    	rf_payload[4] = (uint8_t)((freq_hz >> 8U) & 0xFFU);
-    	rf_payload[5] = (uint8_t)((freq_hz >> 16U) & 0xFFU);
-    	rf_payload[6] = (uint8_t)((freq_hz >> 24U) & 0xFFU);
-
-    	/* Byte 7: Configured TX power */
-    	rf_payload[7] = (uint8_t)TX_OUTPUT_POWER;
-
-    	/* Byte 8: LoRa Spreading Factor */
-    	rf_payload[8] = (uint8_t)LORA_SPREADING_FACTOR;
-
-        rf_length = Protocol_BuildFrame(
-            rf_packet,
-
-            DEVICE_ADDR_MASTER,
-            DEVICE_ADDR_BOARD2,
-
-            CMD_RF_STATS,
-
-            frame.seq,
-
-            rf_payload,
-            sizeof(rf_payload));
-
-        if (rf_length == 0U)
-        {
-            LoRa_StartRx();
-            return;
-        }
-
-        /* =================================================
-         * 4. Send RF information to PC via RS485
-         * ================================================= */
-
-        if (RS485_Send(
-                rf_packet,
-                rf_length) == 0U)
-        {
-            LoRa_StartRx();
-            return;
-        }
-
-        /* =================================================
-         * 5. Send COMPLETE original DATA frame
-         *
-         * IMPORTANT:
-         *
-         * Keep the complete frame:
-         *
-         * AA 55 DST SRC CMD SEQ LEN PAYLOAD CRC
-         *
-         * payload[0]  = GPIO MASK
-         * payload[1..] = Temperature / RS485 data
-         *
-         * Also forward heartbeat packets (LEN = 1).
-         * ================================================= */
-
-        if (RS485_Send(
-                BufferRx,
-                RxBufferSize) == 0U)
-        {
-            LoRa_StartRx();
-            return;
-        }
-
-        /* Remember successfully forwarded packet */
-        last_rx_sequence = frame.seq;
-
-        last_rx_sequence_valid = 1U;
-    }
-
-    /* =====================================================
-     * 6. Build ACK
-     *
-     * ACK is also transmitted for duplicate packets.
-     * ===================================================== */
-
-    ack_length = Protocol_BuildFrame(
-        BufferTx,
-
-        DEVICE_ADDR_BOARD1,
-        DEVICE_ADDR_BOARD2,
-
-        CMD_LINK_ACK,
-
-        frame.seq,
-
-        NULL,
-        0U);
-
-    if (ack_length == 0U)
-    {
-        LoRa_StartRx();
-        return;
-    }
-
-    /* =====================================================
-     * 7. Allow Board 1 to switch from TX to RX
-     * ===================================================== */
-
-    HAL_Delay(
-        Radio.GetWakeupTime() + RX_TIME_MARGIN);
-
-    /* =====================================================
-     * 8. Transmit ACK
-     *
-     * PA11 turns ON during ACK transmission.
-     * ===================================================== */
-
-    LoRa_StartTx(ack_length);
-}
-
-#endif
-
-/* =========================================================
- * MAIN LORA STATE MACHINE
- * ========================================================= */
+/* =========================================
+ * MAIN RADIO PROCESS
+ * ========================================= */
 
 static void LoRa_Process(void)
 {
     RadioEventType event = radio_event;
 
+    TxKind finished_kind;
+
     radio_event = EVENT_NONE;
 
     switch (event)
     {
-        /* ================================================
+        /* ---------------------------------
          * RX DONE
-         * ================================================ */
+         * --------------------------------- */
 
         case EVENT_RX_DONE:
         {
             Radio.Sleep();
 
-#if (BOARD_ROLE == BOARD_1_TX)
-
-            /* Board 1 receives ACK */
-            Board1_ProcessReceived();
+            ProcessReceived();
 
             LoRa_StartRx();
-
-#else
-
-            /* Board 2 receives DATA */
-            Board2_ProcessReceived();
-
-#endif
 
             break;
         }
 
-        /* ================================================
+        /* ---------------------------------
          * TX DONE
-         * ================================================ */
+         * --------------------------------- */
 
         case EVENT_TX_DONE:
         {
             radio_tx_active = 0U;
 
-            /*
-             * Keep LED ON for another LED_TX_HOLD_MS,
-             * then timerLed will turn it OFF.
-             */
+            finished_kind = current_tx_kind;
+            current_tx_kind = TX_KIND_NONE;
+
             UTIL_TIMER_Start(&timerLed);
 
-#if (BOARD_ROLE == BOARD_1_TX)
-
-            waiting_ack = 1U;
-
-#endif
-
-            /* Switch radio back to RX */
-            Radio.Sleep();
-
-            LoRa_StartRx();
-
-            break;
-        }
-
-        /* ================================================
-         * RX TIMEOUT
-         * ================================================ */
-
-        case EVENT_RX_TIMEOUT:
-        {
-            Radio.Sleep();
-
-#if (BOARD_ROLE == BOARD_1_TX)
-
-            if (waiting_ack != 0U)
+            if (finished_kind == TX_KIND_DATA)
             {
-                /* ACK timeout */
-                waiting_ack = 0U;
+                waiting_ack = 1U;
 
-                if (tx_carries_serial != 0U)
-                {
-                    retry_count++;
-
-                    if (retry_count > LINK_MAX_RETRY)
-                    {
-                        /* Give up: drop RS485 data */
-                        g_lora_drop++;
-
-                        serial_pending_valid = 0U;
-                        serial_pending_length = 0U;
-
-                        tx_carries_serial = 0U;
-                        retry_count = 0U;
-                    }
-                    else
-                    {
-                        /* Resend the same data, same sequence */
-                        g_lora_retry++;
-
-                        resend_pending = 1U;
-                    }
-                }
+                ack_deadline_ms =
+                    HAL_GetTick() +
+                    BRIDGE_ACK_TIMEOUT_MS;
+            }
+            else if ((finished_kind == TX_KIND_ACK) &&
+                     waiting_ack)
+            {
+                ack_deadline_ms =
+                    HAL_GetTick() +
+                    BRIDGE_ACK_TIMEOUT_MS;
             }
 
-#endif
-
-            LoRa_StartRx();
-
-            break;
-        }
-
-        /* ================================================
-         * RX ERROR
-         * ================================================ */
-
-        case EVENT_RX_ERROR:
-        {
             Radio.Sleep();
 
             LoRa_StartRx();
@@ -1063,32 +846,53 @@ static void LoRa_Process(void)
             break;
         }
 
-        /* ================================================
+        /* ---------------------------------
          * TX TIMEOUT
-         * ================================================ */
+         * --------------------------------- */
 
         case EVENT_TX_TIMEOUT:
         {
-            Radio.Sleep();
-
             radio_tx_active = 0U;
+
+            finished_kind = current_tx_kind;
+            current_tx_kind = TX_KIND_NONE;
 
             UTIL_TIMER_Stop(&timerLed);
 
-            /* Force PA11 OFF on TX error */
-            LED_TxOff();
+            HAL_GPIO_WritePin(
+                Led_Signal_GPIO_Port,
+                Led_Signal_Pin,
+                GPIO_PIN_RESET
+            );
 
-#if (BOARD_ROLE == BOARD_1_TX)
+            Radio.Sleep();
 
-            waiting_ack = 0U;
+            LoRa_StartRx();
 
-            /* Radio never sent it: try again with the same sequence */
-            if (tx_carries_serial != 0U)
+            if (finished_kind == TX_KIND_DATA)
             {
-                resend_pending = 1U;
+                RetryOrDrop();
+            }
+            else if (finished_kind == TX_KIND_ACK)
+            {
+                ack_pending = 1U;
+
+                ack_due_ms =
+                    HAL_GetTick() +
+                    BRIDGE_ACK_DELAY_MS;
             }
 
-#endif
+            break;
+        }
+
+        /* ---------------------------------
+         * RX TIMEOUT / RX ERROR
+         * --------------------------------- */
+
+        case EVENT_RX_TIMEOUT:
+        case EVENT_RX_ERROR:
+        {
+            Radio.Sleep();
 
             LoRa_StartRx();
 
@@ -1102,10 +906,18 @@ static void LoRa_Process(void)
         }
     }
 
-    /* Board 1 sends the next queued packet */
-#if (BOARD_ROLE == BOARD_1_TX)
+    /* Process pending ACK / DATA / retries */
+    Bridge_Service();
 
-    Board1_TransmitPending();
+    /* Stop timer when the bridge is idle */
+    if (bridge_timer_active &&
+        !outgoing_valid &&
+        !waiting_ack &&
+        !ack_pending &&
+        !radio_tx_active)
+    {
+        UTIL_TIMER_Stop(&timerBridge);
 
-#endif
+        bridge_timer_active = 0U;
+    }
 }

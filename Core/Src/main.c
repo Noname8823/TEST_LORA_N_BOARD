@@ -2,21 +2,21 @@
 #include "main.h"
 
 #include "app_subghz_phy.h"
+#include "subghz_phy_app.h"
 
 #include "gpio.h"
 #include "usart.h"
 
 #include "app_inputs.h"
 #include "rs485.h"
-#include "wind_sensor.h"
-
 #include "board_config.h"
-#include "wind_sensor.h"
+
 /* =========================================================
  * FUNCTION PROTOTYPES
  * ========================================================= */
 
 void SystemClock_Config(void);
+
 
 /* =========================================================
  * MAIN
@@ -27,50 +27,49 @@ int main(void)
     /* Initialize HAL */
     HAL_Init();
 
-    /* System clock */
+    /* Configure system clock */
     SystemClock_Config();
 
     /* Initialize GPIO */
     MX_GPIO_Init();
 
-    /*
-     * Force PA11 OFF immediately after GPIO init.
-     *
-     * PA11 LOW = LED OFF.
-     */
+    /* PA11: TX LED initially OFF */
     HAL_GPIO_WritePin(
         Led_Signal_GPIO_Port,
         Led_Signal_Pin,
-        GPIO_PIN_RESET);
+        GPIO_PIN_RESET
+    );
 
-    /* Default RS485 direction = RX */
+    /* MAX3485 initially in RX mode */
     HAL_GPIO_WritePin(
         RS485_DR_GPIO_Port,
         RS485_DR_Pin,
-        GPIO_PIN_RESET);
+        GPIO_PIN_RESET
+    );
 
     /* Initialize USART2 */
     MX_USART2_UART_Init();
 
-    /* Initialize four opto inputs */
+    /* Initialize 4 opto inputs */
     Inputs_Init();
 
     /*
-     * Initialize LoRa middleware.
+     * Initialize LoRa middleware:
      *
-     * This also initializes the RTC timer,
-     * radio driver and sequencer.
+     * - Radio
+     * - RTC timer
+     * - Sequencer
+     * - LoRa TX/RX callbacks
      */
     MX_SubGHz_Phy_Init();
 
     /*
-     * Initialize RS485 after the original
-     * middleware UART initialization.
+     * Initialize RS485:
+     *
+     * Both boards enable UART RX interrupt.
      */
     RS485_Init();
 
-    /* RK100-02 wind sensor (Board 1 only) */
-    Wind_Init();
 
     /* =====================================================
      * MAIN LOOP
@@ -78,24 +77,39 @@ int main(void)
 
     while (1)
     {
-        /* Update opto input status */
+        /* Update digital input states */
         Inputs_Task();
 
         /*
-         * Board 1:
-         * Process incoming RS485 data.
+         * Process RS485:
          *
-         * Board 2:
-         * RS485 data is forwarded directly
-         * from the LoRa processing task.
+         * Receive UART bytes.
+         * Detect UART frame gap.
+         * Queue RAW data for LoRa transmission.
          */
         RS485_Task();
-        Wind_Task();
 
-        /* Process LoRa radio events */
+        /*
+         * Transparent LoRa Bridge:
+         *
+         * - Handle pending DATA
+         * - Handle ACK timeout
+         * - Handle retries
+         */
+        SubghzApp_Task();
+
+        /*
+         * Process LoRa radio events:
+         *
+         * TX DONE
+         * RX DONE
+         * TX TIMEOUT
+         * RX ERROR
+         */
         MX_SubGHz_Phy_Process();
     }
 }
+
 
 /* =========================================================
  * SYSTEM CLOCK CONFIGURATION
@@ -104,27 +118,31 @@ int main(void)
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-    /* Configure LSE drive capability */
+    /* Enable backup domain access */
     HAL_PWR_EnableBkUpAccess();
 
+    /* Configure LSE drive capability */
     __HAL_RCC_LSEDRIVE_CONFIG(
-        RCC_LSEDRIVE_LOW);
+        RCC_LSEDRIVE_LOW
+    );
 
-    /* Configure main regulator */
+    /* Configure voltage scaling */
     __HAL_PWR_VOLTAGESCALING_CONFIG(
-        PWR_REGULATOR_VOLTAGE_SCALE1);
+        PWR_REGULATOR_VOLTAGE_SCALE1
+    );
 
-    /* Oscillator configuration */
+    /* Configure oscillators */
     RCC_OscInitStruct.OscillatorType =
         RCC_OSCILLATORTYPE_LSE |
         RCC_OSCILLATORTYPE_MSI;
 
-    RCC_OscInitStruct.LSEState = RCC_LSE_ON;
+    RCC_OscInitStruct.LSEState =
+        RCC_LSE_ON;
 
-    RCC_OscInitStruct.MSIState = RCC_MSI_ON;
+    RCC_OscInitStruct.MSIState =
+        RCC_MSI_ON;
 
     RCC_OscInitStruct.MSICalibrationValue =
         RCC_MSICALIBRATION_DEFAULT;
@@ -141,10 +159,10 @@ void SystemClock_Config(void)
         Error_Handler();
     }
 
-    /* CPU / AHB / APB clock configuration */
+    /* Configure CPU / AHB / APB clocks */
     RCC_ClkInitStruct.ClockType =
         RCC_CLOCKTYPE_HCLK3 |
-        RCC_CLOCKTYPE_HCLK |
+        RCC_CLOCKTYPE_HCLK  |
         RCC_CLOCKTYPE_SYSCLK |
         RCC_CLOCKTYPE_PCLK1 |
         RCC_CLOCKTYPE_PCLK2;
@@ -172,6 +190,7 @@ void SystemClock_Config(void)
     }
 }
 
+
 /* =========================================================
  * ERROR HANDLER
  * ========================================================= */
@@ -182,8 +201,14 @@ void Error_Handler(void)
 
     while (1)
     {
+        /* Stay here when a fatal error occurs */
     }
 }
+
+
+/* =========================================================
+ * ASSERT FAILED
+ * ========================================================= */
 
 #ifdef USE_FULL_ASSERT
 
