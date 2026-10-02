@@ -16,7 +16,7 @@ extern "C" {
 
 /* ================= RADIO FREQUENCY ================= */
 
-#define RF_FREQUENCY 917300000U
+#define RF_FREQUENCY 433000000U
 
 #ifndef TX_OUTPUT_POWER
 #define TX_OUTPUT_POWER 14

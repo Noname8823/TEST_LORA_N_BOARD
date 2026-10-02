@@ -758,11 +758,11 @@ static void Board2_ProcessReceived(void)
     uint16_t rf_length;
 
     /* RF frame: 9-byte overhead + 3-byte payload */
-    uint8_t rf_packet[12];
-    uint8_t rf_payload[3];
+    uint8_t rf_packet[18];
+    uint8_t rf_payload[9];
 
     int16_t rssi;
-
+    uint32_t freq_hz;
     /* =====================================================
      * 1. Decode received LoRa packet and check CRC
      * ===================================================== */
@@ -808,16 +808,32 @@ static void Board2_ProcessReceived(void)
          * Sequence = Same as DATA packet
          * ================================================= */
 
-        rssi = g_rx_rssi_dbm;
 
-        rf_payload[0] =
-            (uint8_t)((uint16_t)rssi & 0xFFU);
+    	/* =========================================
+    	 * BUILD RF INFORMATION
+    	 * ========================================= */
 
-        rf_payload[1] =
-            (uint8_t)(((uint16_t)rssi >> 8U) & 0xFFU);
+    	rssi = g_rx_rssi_dbm;
+    	freq_hz = (uint32_t)RF_FREQUENCY;
 
-        rf_payload[2] =
-            (uint8_t)g_rx_snr_db;
+    	/* Byte 0-1: RSSI (signed int16) */
+    	rf_payload[0] = (uint8_t)((uint16_t)rssi & 0xFFU);
+    	rf_payload[1] = (uint8_t)(((uint16_t)rssi >> 8U) & 0xFFU);
+
+    	/* Byte 2: SNR (signed int8) */
+    	rf_payload[2] = (uint8_t)g_rx_snr_db;
+
+    	/* Byte 3-6: Frequency in Hz, Little Endian */
+    	rf_payload[3] = (uint8_t)(freq_hz & 0xFFU);
+    	rf_payload[4] = (uint8_t)((freq_hz >> 8U) & 0xFFU);
+    	rf_payload[5] = (uint8_t)((freq_hz >> 16U) & 0xFFU);
+    	rf_payload[6] = (uint8_t)((freq_hz >> 24U) & 0xFFU);
+
+    	/* Byte 7: Configured TX power */
+    	rf_payload[7] = (uint8_t)TX_OUTPUT_POWER;
+
+    	/* Byte 8: LoRa Spreading Factor */
+    	rf_payload[8] = (uint8_t)LORA_SPREADING_FACTOR;
 
         rf_length = Protocol_BuildFrame(
             rf_packet,

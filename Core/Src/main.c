@@ -8,9 +8,10 @@
 
 #include "app_inputs.h"
 #include "rs485.h"
+#include "wind_sensor.h"
 
 #include "board_config.h"
-
+#include "wind_sensor.h"
 /* =========================================================
  * FUNCTION PROTOTYPES
  * ========================================================= */
@@ -68,6 +69,9 @@ int main(void)
      */
     RS485_Init();
 
+    /* RK100-02 wind sensor (Board 1 only) */
+    Wind_Init();
+
     /* =====================================================
      * MAIN LOOP
      * ===================================================== */
@@ -86,6 +90,7 @@ int main(void)
          * from the LoRa processing task.
          */
         RS485_Task();
+        Wind_Task();
 
         /* Process LoRa radio events */
         MX_SubGHz_Phy_Process();
