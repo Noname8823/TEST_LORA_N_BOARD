@@ -80,36 +80,17 @@ int main(void)
 
     while (1)
     {
-        /* Update digital input states */
-        Inputs_Task();
+        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_11);
 
-        /*
-         * Process RS485:
-         *
-         * Receive UART bytes.
-         * Detect UART frame gap.
-         * Queue RAW data for LoRa transmission.
-         */
-        RS485_Task();
+        HAL_UART_Transmit(
+            &huart_test,
+            msg,
+            sizeof(msg) - 1,
+            1000
+        );
 
-        /*
-         * Transparent LoRa Bridge:
-         *
-         * - Handle pending DATA
-         * - Handle ACK timeout
-         * - Handle retries
-         */
-        SubghzApp_Task();
+        HAL_Delay(500);
 
-        /*
-         * Process LoRa radio events:
-         *
-         * TX DONE
-         * RX DONE
-         * TX TIMEOUT
-         * RX ERROR
-         */
-        MX_SubGHz_Phy_Process();
     }
 }
 
