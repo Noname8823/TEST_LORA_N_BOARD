@@ -2,6 +2,17 @@
 #include "board_config.h"
 #include "subghz_phy_app.h"
 #include "usart.h"
+#include "bridge_command.h"
+
+/* Debug configuration command */
+volatile uint32_t g_cfg_calls = 0;
+volatile uint32_t g_cfg_handled = 0;
+volatile uint32_t g_cfg_forwarded = 0;
+
+volatile uint8_t g_cfg_length = 0;
+volatile uint8_t g_cfg_result = 0;
+
+volatile uint8_t g_cfg_raw[48] = {0};
 
 /* UART RX FIFO */
 static volatile uint8_t fifo_data[RS485_FIFO_SIZE];
@@ -228,13 +239,57 @@ uint8_t RS485_Send(
 
 static uint8_t RS485_SubmitChunk(void)
 {
-    if (chunk_len == 0U)
-        return 1U;
+    uint8_t result;
 
-    /* Preserve data if LoRa queue is occupied */
-    if (!SubghzApp_QueueSerial(
+    if (chunk_len == 0U)
+    {
+        return 1U;
+    }
+
+    /* =====================================
+     * DEBUG RECEIVED COMMAND
+     * ===================================== */
+
+    g_cfg_calls++;
+
+    g_cfg_length = chunk_len;
+
+    for (uint8_t i = 0; i < chunk_len; i++)
+    {
+        g_cfg_raw[i] = chunk[i];
+    }
+
+    /* =====================================
+     * CHECK CONFIGURATION COMMAND
+     * ===================================== */
+
+    result = BridgeCommand_TryHandle(
+        chunk,
+        chunk_len
+    );
+
+    g_cfg_result = result;
+
+    if (result != 0U)
+    {
+        /* Command processed locally */
+
+        g_cfg_handled++;
+
+        chunk_len = 0U;
+
+        return 1U;
+    }
+
+    /* =====================================
+     * NORMAL TRANSPARENT LORA DATA
+     * ===================================== */
+
+    g_cfg_forwarded++;
+
+    if (SubghzApp_QueueSerial(
             chunk,
-            chunk_len))
+            chunk_len) == 0U)
     {
         return 0U;
     }
@@ -245,7 +300,6 @@ static uint8_t RS485_SubmitChunk(void)
 
     return 1U;
 }
-
 /* =========================================
  * MAIN RS485 TASK
  * ========================================= */

@@ -1,7 +1,9 @@
+
 #include "platform.h"
 #include "sys_app.h"
 #include "subghz_phy_app.h"
 #include "radio.h"
+#include "bridge_config.h"
 
 #include "stm32_timer.h"
 #include "stm32_seq.h"
@@ -12,9 +14,18 @@
 #include "protocol.h"
 #include "rs485.h"
 
+#include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 
-/* Point-to-point: exactly two identical nodes */
+/* =========================================================
+ * BRIDGE CONFIGURATION
+ * ========================================================= */
+
+/*
+ * Current point-to-point protocol identifiers.
+ * Keep these values unchanged for this latency fix.
+ */
 #define BRIDGE_DST             0xFFU
 #define BRIDGE_SRC             0x42U
 
@@ -24,13 +35,22 @@
 #define MAX_APP_BUFFER_SIZE    255U
 #define BRIDGE_DUP_WINDOW_MS   10000U
 
+/*
+ * IMPORTANT:
+ *
+ * Bridge timer runs continuously.
+ * It is independent from LoRa RX timeout.
+ */
+#define BRIDGE_TICK_MS         10U
+
 #if (RS485_DATA_MAX > PROTO_MAX_PAYLOAD)
 #error "RS485 payload too large"
 #endif
 
-/* =========================================
- * EVENT DEFINITIONS
- * ========================================= */
+
+/* =========================================================
+ * RADIO EVENTS
+ * ========================================================= */
 
 typedef enum
 {
@@ -45,17 +65,20 @@ typedef enum
 
 } RadioEventType;
 
+
 typedef enum
 {
     TX_KIND_NONE = 0,
+
     TX_KIND_DATA,
     TX_KIND_ACK
 
 } TxKind;
 
-/* =========================================
+
+/* =========================================================
  * RADIO VARIABLES
- * ========================================= */
+ * ========================================================= */
 
 static RadioEvents_t RadioEvents;
 
@@ -69,14 +92,20 @@ static uint16_t RxBufferSize;
 static uint8_t radio_tx_active;
 static TxKind current_tx_kind;
 
+
+/* =========================================================
+ * TIMERS
+ * ========================================================= */
+
 static UTIL_TIMER_Object_t timerLed;
 static UTIL_TIMER_Object_t timerBridge;
 
 static uint8_t bridge_timer_active;
 
-/* =========================================
- * OUTGOING DATA
- * ========================================= */
+
+/* =========================================================
+ * OUTGOING RS485 DATA
+ * ========================================================= */
 
 static uint8_t outgoing[RS485_DATA_MAX];
 
@@ -92,29 +121,40 @@ static uint8_t waiting_ack;
 static uint32_t ack_deadline_ms;
 static uint32_t next_data_ms;
 
-/* =========================================
+
+/* =========================================================
  * ACK STATE
- * ========================================= */
+ * ========================================================= */
 
 static uint8_t ack_pending;
 static uint8_t ack_seq;
 
 static uint32_t ack_due_ms;
 
-/* Duplicate protection */
+
+/* =========================================================
+ * DUPLICATE PROTECTION
+ * ========================================================= */
 
 static uint8_t last_rx_valid;
 static uint8_t last_rx_seq;
 
 static uint32_t last_rx_ms;
 
-/* =========================================
- * DEBUG
- * ========================================= */
+
+/* =========================================================
+ * DEBUG VARIABLES
+ * ========================================================= */
 
 int8_t RssiValue;
 int8_t SnrValue;
 
+/* Actual configuration passed to Radio */
+volatile uint32_t g_rf_applied_freq = 0U;
+volatile uint8_t  g_rf_applied_sf   = 0U;
+volatile uint8_t  g_rf_applied_bw   = 0U;
+
+/* LoRa debug */
 volatile uint32_t g_lora_tx_start;
 volatile uint32_t g_lora_tx_done;
 volatile uint32_t g_lora_rx_done;
@@ -130,9 +170,20 @@ volatile uint32_t g_lora_dup_rx;
 
 volatile uint32_t g_lora_uart_forward;
 
-/* =========================================
- * PROTOTYPES
- * ========================================= */
+/*
+ * NEW DEBUG VARIABLES:
+ *
+ * Verify that the periodic bridge timer
+ * is running even while LoRa is idle.
+ */
+volatile uint32_t g_bridge_tick_count = 0U;
+volatile uint32_t g_bridge_process_count = 0U;
+volatile uint32_t g_bridge_last_process_ms = 0U;
+
+
+/* =========================================================
+ * FUNCTION PROTOTYPES
+ * ========================================================= */
 
 static void OnTxDone(void);
 
@@ -148,14 +199,25 @@ static void OnRxTimeout(void);
 static void OnRxError(void);
 
 static void LoRa_Process(void);
+static void Bridge_Service(void);
 
-/* =========================================
- * BRIDGE TIMER
- * ========================================= */
+
+/* =========================================================
+ * BRIDGE TIMER CALLBACK
+ * ========================================================= */
+
+/*
+ * This timer wakes up the STM32 sequencer
+ * periodically, independently of radio events.
+ *
+ * Do not call blocking UART transmit here.
+ */
 
 static void Bridge_Tick(void *context)
 {
     (void)context;
+
+    g_bridge_tick_count++;
 
     UTIL_SEQ_SetTask(
         (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
@@ -163,9 +225,22 @@ static void Bridge_Tick(void *context)
     );
 }
 
+
+/* =========================================================
+ * START BRIDGE TIMER
+ * ========================================================= */
+
 static void Bridge_StartTick(void)
 {
-    if (!bridge_timer_active)
+    /*
+     * Normally already running since
+     * SubghzApp_Init().
+     *
+     * Keep this helper for compatibility
+     * with existing TX / ACK code.
+     */
+
+    if (bridge_timer_active == 0U)
     {
         bridge_timer_active = 1U;
 
@@ -173,9 +248,10 @@ static void Bridge_StartTick(void)
     }
 }
 
-/* =========================================
+
+/* =========================================================
  * TIME CHECK
- * ========================================= */
+ * ========================================================= */
 
 static uint8_t TimeReached(uint32_t deadline)
 {
@@ -184,17 +260,19 @@ static uint8_t TimeReached(uint32_t deadline)
     ) ? 1U : 0U;
 }
 
-/* =========================================
- * RETRY BACKOFF
- * ========================================= */
+
+/* =========================================================
+ * RETRY JITTER
+ * ========================================================= */
 
 static uint32_t RetryJitter(void)
 {
     /*
-     * Use chip UID to reduce the chance
-     * of both boards starting TX together.
+     * Use STM32 unique ID to reduce
+     * the probability of simultaneous TX.
      *
-     * This does not guarantee collision-free TX.
+     * This does not guarantee
+     * collision-free communication.
      */
 
     uint32_t mix =
@@ -214,9 +292,10 @@ static uint32_t RetryJitter(void)
     return 35U + (mix % 180U);
 }
 
-/* =========================================
+
+/* =========================================================
  * PA11 TX LED
- * ========================================= */
+ * ========================================================= */
 
 static void LED_Off(void *context)
 {
@@ -229,18 +308,26 @@ static void LED_Off(void *context)
     );
 }
 
-/* =========================================
- * START RX
- * ========================================= */
+
+/* =========================================================
+ * START LORA RX
+ * ========================================================= */
 
 static void LoRa_StartRx(void)
 {
+    /*
+     * RX timeout is independent of UART
+     * processing because timerBridge now
+     * runs every 10 ms.
+     */
+
     Radio.Rx(RX_TIMEOUT_VALUE);
 }
 
-/* =========================================
- * START TX
- * ========================================= */
+
+/* =========================================================
+ * START LORA TX
+ * ========================================================= */
 
 static void LoRa_StartTx(
     uint16_t length,
@@ -257,11 +344,13 @@ static void LoRa_StartTx(
     Radio.Sleep();
 
     radio_tx_active = 1U;
+
     current_tx_kind = kind;
 
     g_lora_tx_start++;
 
-    /* PA11 HIGH during TX */
+    /* PA11 HIGH during LoRa TX */
+
     HAL_GPIO_WritePin(
         Led_Signal_GPIO_Port,
         Led_Signal_Pin,
@@ -271,9 +360,10 @@ static void LoRa_StartTx(
     Radio.Send(BufferTx, length);
 }
 
-/* =========================================
+
+/* =========================================================
  * RETRY OR DROP
- * ========================================= */
+ * ========================================================= */
 
 static void RetryOrDrop(void)
 {
@@ -297,9 +387,10 @@ static void RetryOrDrop(void)
     }
 }
 
-/* =========================================
+
+/* =========================================================
  * QUEUE RAW RS485 DATA
- * ========================================= */
+ * ========================================================= */
 
 uint8_t SubghzApp_QueueSerial(
     const uint8_t *data,
@@ -308,25 +399,41 @@ uint8_t SubghzApp_QueueSerial(
     if ((data == NULL) ||
         (length == 0U) ||
         (length > RS485_DATA_MAX) ||
-        outgoing_valid)
+        (outgoing_valid != 0U))
     {
         return 0U;
     }
 
-    memcpy(outgoing, data, length);
+    /* Copy raw UART bytes */
+
+    memcpy(
+        outgoing,
+        data,
+        length
+    );
 
     outgoing_len = length;
     outgoing_valid = 1U;
+
+    /* Sequence number */
 
     outgoing_seq = next_seq++;
 
     send_attempts = 0U;
 
-    /* Initial backoff */
+    /* Initial transmission backoff */
+
     next_data_ms =
         HAL_GetTick() + RetryJitter();
 
+    /*
+     * Timer is continuously running.
+     * This also handles any legacy stop state.
+     */
+
     Bridge_StartTick();
+
+    /* Request immediate sequencer processing */
 
     UTIL_SEQ_SetTask(
         (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
@@ -336,34 +443,41 @@ uint8_t SubghzApp_QueueSerial(
     return 1U;
 }
 
-/* =========================================
+
+/* =========================================================
  * BRIDGE PERIODIC TASK
- * ========================================= */
+ * ========================================================= */
 
 void SubghzApp_Task(void)
 {
     uint8_t wake = 0U;
 
-    if (ack_pending &&
+    /* Pending ACK */
+
+    if ((ack_pending != 0U) &&
         TimeReached(ack_due_ms))
     {
         wake = 1U;
     }
 
-    if (waiting_ack &&
+    /* ACK timeout */
+
+    if ((waiting_ack != 0U) &&
         TimeReached(ack_deadline_ms))
     {
         wake = 1U;
     }
 
-    if (outgoing_valid &&
-        !waiting_ack &&
+    /* Pending outgoing DATA */
+
+    if ((outgoing_valid != 0U) &&
+        (waiting_ack == 0U) &&
         TimeReached(next_data_ms))
     {
         wake = 1U;
     }
 
-    if (wake)
+    if (wake != 0U)
     {
         UTIL_SEQ_SetTask(
             (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
@@ -372,14 +486,38 @@ void SubghzApp_Task(void)
     }
 }
 
-/* =========================================
- * LORA INIT
- * ========================================= */
+
+/* =========================================================
+ * LORA INITIALIZATION
+ * ========================================================= */
 
 void SubghzApp_Init(void)
 {
-    memset(BufferRx, 0, sizeof(BufferRx));
-    memset(BufferTx, 0, sizeof(BufferTx));
+    /*
+     * Load ACTIVE configuration.
+     *
+     * BridgeConfig_Init() must already
+     * have been called in main.c.
+     */
+
+    const BridgeSettings *cfg = BridgeConfig_Get();
+
+
+    /* -----------------------------------------------------
+     * Reset radio buffers
+     * ----------------------------------------------------- */
+
+    memset(
+        BufferRx,
+        0,
+        sizeof(BufferRx)
+    );
+
+    memset(
+        BufferTx,
+        0,
+        sizeof(BufferTx)
+    );
 
     RxBufferSize = 0U;
 
@@ -387,6 +525,11 @@ void SubghzApp_Init(void)
 
     radio_tx_active = 0U;
     current_tx_kind = TX_KIND_NONE;
+
+
+    /* -----------------------------------------------------
+     * Reset bridge state
+     * ----------------------------------------------------- */
 
     bridge_timer_active = 0U;
 
@@ -399,13 +542,28 @@ void SubghzApp_Init(void)
     send_attempts = 0U;
 
     ack_pending = 0U;
+
     last_rx_valid = 0U;
+
+    g_bridge_tick_count = 0U;
+    g_bridge_process_count = 0U;
+    g_bridge_last_process_ms = 0U;
+
+
+    /* -----------------------------------------------------
+     * PA11 LED OFF
+     * ----------------------------------------------------- */
 
     HAL_GPIO_WritePin(
         Led_Signal_GPIO_Port,
         Led_Signal_Pin,
         GPIO_PIN_RESET
     );
+
+
+    /* -----------------------------------------------------
+     * Create TX LED timer
+     * ----------------------------------------------------- */
 
     UTIL_TIMER_Create(
         &timerLed,
@@ -415,19 +573,29 @@ void SubghzApp_Init(void)
         NULL
     );
 
-    /*
-     * Keeps ACK and retry deadlines alive
-     * while STM32 sequencer is idle.
-     */
+
+    /* -----------------------------------------------------
+     * Create periodic Bridge timer
+     *
+     * IMPORTANT:
+     *
+     * This timer is never stopped when
+     * the application becomes idle.
+     * ----------------------------------------------------- */
+
     UTIL_TIMER_Create(
         &timerBridge,
-        10U,
+        BRIDGE_TICK_MS,
         UTIL_TIMER_PERIODIC,
         Bridge_Tick,
         NULL
     );
 
-    /* Radio callbacks */
+
+    /* -----------------------------------------------------
+     * Register radio callbacks
+     * ----------------------------------------------------- */
+
     RadioEvents.TxDone = OnTxDone;
     RadioEvents.RxDone = OnRxDone;
 
@@ -437,42 +605,94 @@ void SubghzApp_Init(void)
 
     Radio.Init(&RadioEvents);
 
-    Radio.SetChannel(RF_FREQUENCY);
+
+    /* -----------------------------------------------------
+     * Record applied RF configuration
+     * ----------------------------------------------------- */
+
+    g_rf_applied_freq = cfg->frequency;
+
+    g_rf_applied_sf = cfg->sf;
+
+    g_rf_applied_bw = cfg->bandwidth;
+
+
+    /* -----------------------------------------------------
+     * Apply RF frequency loaded from Flash
+     * ----------------------------------------------------- */
+
+    Radio.SetChannel(cfg->frequency);
+
 
 #if ((USE_MODEM_LORA == 1) && (USE_MODEM_FSK == 0))
 
+    /* -----------------------------------------------------
+     * LoRa TX configuration
+     * ----------------------------------------------------- */
+
     Radio.SetTxConfig(
         MODEM_LORA,
-        TX_OUTPUT_POWER,
+
+        cfg->power,
+
         0,
-        LORA_BANDWIDTH,
-        LORA_SPREADING_FACTOR,
-        LORA_CODINGRATE,
+
+        cfg->bandwidth,
+
+        cfg->sf,
+
+        cfg->cr,
+
         LORA_PREAMBLE_LENGTH,
+
         LORA_FIX_LENGTH_PAYLOAD_ON,
+
         true,
+
         0,
+
         0,
+
         LORA_IQ_INVERSION_ON,
+
         TX_TIMEOUT_VALUE
     );
 
+
+    /* -----------------------------------------------------
+     * LoRa RX configuration
+     * ----------------------------------------------------- */
+
     Radio.SetRxConfig(
         MODEM_LORA,
-        LORA_BANDWIDTH,
-        LORA_SPREADING_FACTOR,
-        LORA_CODINGRATE,
+
+        cfg->bandwidth,
+
+        cfg->sf,
+
+        cfg->cr,
+
         0,
+
         LORA_PREAMBLE_LENGTH,
+
         LORA_SYMBOL_TIMEOUT,
+
         LORA_FIX_LENGTH_PAYLOAD_ON,
+
         0,
+
         true,
+
         0,
+
         0,
+
         LORA_IQ_INVERSION_ON,
+
         true
     );
+
 
     Radio.SetMaxPayloadLength(
         MODEM_LORA,
@@ -480,22 +700,49 @@ void SubghzApp_Init(void)
     );
 
 #else
+
 #error "This bridge implementation is LoRa-only"
+
 #endif
+
+
+    /* -----------------------------------------------------
+     * Register application task
+     * ----------------------------------------------------- */
 
     UTIL_SEQ_RegTask(
         (1UL << CFG_SEQ_Task_SubGHz_Phy_App_Process),
+
         UTIL_SEQ_RFU,
+
         LoRa_Process
     );
 
-    /* Both boards start in RX */
+
+    /* -----------------------------------------------------
+     * Start in RX mode
+     * ----------------------------------------------------- */
+
     LoRa_StartRx();
+
+
+    /* =====================================================
+     * IMPORTANT FIX
+     *
+     * Start continuous 10 ms bridge timer.
+     *
+     * Do this AFTER registering LoRa_Process().
+     * ===================================================== */
+
+    bridge_timer_active = 1U;
+
+    UTIL_TIMER_Start(&timerBridge);
 }
 
-/* =========================================
- * RADIO CALLBACKS
- * ========================================= */
+
+/* =========================================================
+ * RADIO TX DONE CALLBACK
+ * ========================================================= */
 
 static void OnTxDone(void)
 {
@@ -509,6 +756,11 @@ static void OnTxDone(void)
     );
 }
 
+
+/* =========================================================
+ * RADIO RX DONE CALLBACK
+ * ========================================================= */
+
 static void OnRxDone(
     uint8_t *payload,
     uint16_t size,
@@ -516,6 +768,7 @@ static void OnRxDone(
     int8_t LoraSnr_FskCfo)
 {
     RssiValue = (int8_t)rssi;
+
     SnrValue = LoraSnr_FskCfo;
 
     g_lora_rx_done++;
@@ -525,11 +778,16 @@ static void OnRxDone(
         (size > sizeof(BufferRx)))
     {
         RxBufferSize = 0U;
+
         radio_event = EVENT_RX_ERROR;
     }
     else
     {
-        memcpy(BufferRx, payload, size);
+        memcpy(
+            BufferRx,
+            payload,
+            size
+        );
 
         RxBufferSize = size;
 
@@ -541,6 +799,11 @@ static void OnRxDone(
         CFG_SEQ_Prio_0
     );
 }
+
+
+/* =========================================================
+ * RADIO TX TIMEOUT CALLBACK
+ * ========================================================= */
 
 static void OnTxTimeout(void)
 {
@@ -554,6 +817,11 @@ static void OnTxTimeout(void)
     );
 }
 
+
+/* =========================================================
+ * RADIO RX TIMEOUT CALLBACK
+ * ========================================================= */
+
 static void OnRxTimeout(void)
 {
     radio_event = EVENT_RX_TIMEOUT;
@@ -563,6 +831,11 @@ static void OnRxTimeout(void)
         CFG_SEQ_Prio_0
     );
 }
+
+
+/* =========================================================
+ * RADIO RX ERROR CALLBACK
+ * ========================================================= */
 
 static void OnRxError(void)
 {
@@ -576,15 +849,21 @@ static void OnRxError(void)
     );
 }
 
-/* =========================================
+
+/* =========================================================
  * PROCESS RECEIVED LORA DATA
- * ========================================= */
+ * ========================================================= */
 
 static void ProcessReceived(void)
 {
     ProtocolFrame frame;
 
     uint32_t now = HAL_GetTick();
+
+
+    /* -----------------------------------------------------
+     * Decode internal LoRa frame
+     * ----------------------------------------------------- */
 
     if (!Protocol_DecodeFrame(
             BufferRx,
@@ -594,22 +873,27 @@ static void ProcessReceived(void)
         return;
     }
 
-    /* Accept only paired bridge packets */
+
+    /* -----------------------------------------------------
+     * Keep original point-to-point filtering
+     * ----------------------------------------------------- */
+
     if ((frame.dst != BRIDGE_DST) ||
         (frame.src != BRIDGE_SRC))
     {
         return;
     }
 
-    /* -------------------------------------
+
+    /* -----------------------------------------------------
      * Received ACK
-     * ------------------------------------- */
+     * ----------------------------------------------------- */
 
     if (frame.cmd == CMD_LINK_ACK)
     {
         if ((frame.len == 0U) &&
-            waiting_ack &&
-            outgoing_valid &&
+            (waiting_ack != 0U) &&
+            (outgoing_valid != 0U) &&
             (frame.seq == outgoing_seq))
         {
             waiting_ack = 0U;
@@ -625,18 +909,24 @@ static void ProcessReceived(void)
         return;
     }
 
-    /* Accept only DATA packets */
+
+    /* -----------------------------------------------------
+     * Accept only DATA
+     * ----------------------------------------------------- */
+
     if ((frame.cmd != CMD_LINK_DATA) ||
-        (frame.len == 0U))
+        (frame.len == 0U) ||
+        (frame.len > RS485_DATA_MAX))
     {
         return;
     }
 
-    /* -------------------------------------
-     * Duplicate detection
-     * ------------------------------------- */
 
-    if (last_rx_valid &&
+    /* -----------------------------------------------------
+     * Duplicate detection
+     * ----------------------------------------------------- */
+
+    if ((last_rx_valid != 0U) &&
         (last_rx_seq == frame.seq) &&
         ((uint32_t)(now - last_rx_ms)
           < BRIDGE_DUP_WINDOW_MS))
@@ -646,25 +936,34 @@ static void ProcessReceived(void)
     else
     {
         /*
-         * Output ONLY raw payload bytes.
+         * Forward ONLY raw payload bytes.
          *
-         * Never forward:
-         * - AA 55
-         * - LoRa packet header
+         * Do not output:
+         *
+         * - LoRa header
+         * - Node address
          * - Internal CRC
-         * - ACK
          * - RF statistics
+         * - ACK
          */
 
-        if (!RS485_Send(
+        if (RS485_Send(
                 frame.payload,
-                frame.len))
+                frame.len) == 0U)
         {
-            /* Failed UART transmission: do not ACK */
+            /*
+             * UART TX failed.
+             * Do not acknowledge this packet.
+             */
+
             return;
         }
 
+
+        /* Update duplicate protection */
+
         last_rx_seq = frame.seq;
+
         last_rx_ms = HAL_GetTick();
 
         last_rx_valid = 1U;
@@ -672,118 +971,164 @@ static void ProcessReceived(void)
         g_lora_uart_forward++;
     }
 
-    /* -------------------------------------
+
+    /* -----------------------------------------------------
      * Schedule ACK
-     * ------------------------------------- */
+     * ----------------------------------------------------- */
 
     ack_seq = frame.seq;
+
     ack_pending = 1U;
 
     ack_due_ms =
         HAL_GetTick() + BRIDGE_ACK_DELAY_MS;
 
+
     Bridge_StartTick();
 
-    if (waiting_ack)
+
+    if (waiting_ack != 0U)
     {
         ack_deadline_ms =
             HAL_GetTick() + BRIDGE_ACK_TIMEOUT_MS;
     }
 }
 
-/* =========================================
- * TRANSMISSION STATE MACHINE
- * ========================================= */
+
+/* =========================================================
+ * BRIDGE TRANSMISSION STATE MACHINE
+ * ========================================================= */
 
 static void Bridge_Service(void)
 {
     uint16_t length;
 
-    if (radio_tx_active)
-        return;
 
-    /*
-     * ACK has priority over new UART traffic.
-     */
-    if (ack_pending)
+    /* Radio is currently transmitting */
+
+    if (radio_tx_active != 0U)
+    {
+        return;
+    }
+
+
+    /* -----------------------------------------------------
+     * 1. ACK has priority
+     * ----------------------------------------------------- */
+
+    if (ack_pending != 0U)
     {
         if (!TimeReached(ack_due_ms))
+        {
             return;
+        }
+
 
         length = Protocol_BuildFrame(
             BufferTx,
+
             BRIDGE_DST,
             BRIDGE_SRC,
+
             CMD_LINK_ACK,
+
             ack_seq,
+
             NULL,
             0U
         );
 
-        if (!length)
+
+        if (length == 0U)
+        {
             return;
+        }
+
 
         ack_pending = 0U;
 
-        LoRa_StartTx(length, TX_KIND_ACK);
+        LoRa_StartTx(
+            length,
+            TX_KIND_ACK
+        );
 
         return;
     }
 
-    /* -------------------------------------
-     * ACK timeout
-     * ------------------------------------- */
 
-    if (waiting_ack)
+    /* -----------------------------------------------------
+     * 2. ACK timeout
+     * ----------------------------------------------------- */
+
+    if (waiting_ack != 0U)
     {
         if (!TimeReached(ack_deadline_ms))
+        {
             return;
+        }
 
         RetryOrDrop();
     }
 
-    /* -------------------------------------
-     * No outgoing data or still waiting
-     * ------------------------------------- */
 
-    if (!outgoing_valid ||
-        waiting_ack ||
-        !TimeReached(next_data_ms))
+    /* -----------------------------------------------------
+     * 3. Check outgoing data
+     * ----------------------------------------------------- */
+
+    if ((outgoing_valid == 0U) ||
+        (waiting_ack != 0U) ||
+        (!TimeReached(next_data_ms)))
     {
         return;
     }
 
-    /* -------------------------------------
-     * Build internal DATA packet
-     * ------------------------------------- */
+
+    /* -----------------------------------------------------
+     * 4. Build DATA frame
+     * ----------------------------------------------------- */
 
     length = Protocol_BuildFrame(
         BufferTx,
+
         BRIDGE_DST,
         BRIDGE_SRC,
+
         CMD_LINK_DATA,
+
         outgoing_seq,
+
         outgoing,
         outgoing_len
     );
 
-    if (!length)
+
+    if (length == 0U)
     {
         g_lora_drop++;
 
         outgoing_valid = 0U;
+        outgoing_len = 0U;
 
         return;
     }
 
+
+    /* -----------------------------------------------------
+     * 5. Start LoRa TX
+     * ----------------------------------------------------- */
+
     send_attempts++;
 
-    LoRa_StartTx(length, TX_KIND_DATA);
+    LoRa_StartTx(
+        length,
+        TX_KIND_DATA
+    );
 }
 
-/* =========================================
+
+/* =========================================================
  * MAIN RADIO PROCESS
- * ========================================= */
+ * ========================================================= */
 
 static void LoRa_Process(void)
 {
@@ -793,11 +1138,32 @@ static void LoRa_Process(void)
 
     radio_event = EVENT_NONE;
 
+
+    /* =====================================================
+     * IMPORTANT FIX:
+     *
+     * Called periodically every 10 ms.
+     *
+     * Handle incoming RS485 data without waiting
+     * for the next LoRa RX timeout.
+     * ===================================================== */
+
+    g_bridge_process_count++;
+
+    g_bridge_last_process_ms = HAL_GetTick();
+
+    RS485_Task();
+
+
+    /* =====================================================
+     * PROCESS RADIO EVENTS
+     * ===================================================== */
+
     switch (event)
     {
-        /* ---------------------------------
+        /* -------------------------------------------------
          * RX DONE
-         * --------------------------------- */
+         * ------------------------------------------------- */
 
         case EVENT_RX_DONE:
         {
@@ -810,18 +1176,21 @@ static void LoRa_Process(void)
             break;
         }
 
-        /* ---------------------------------
+
+        /* -------------------------------------------------
          * TX DONE
-         * --------------------------------- */
+         * ------------------------------------------------- */
 
         case EVENT_TX_DONE:
         {
             radio_tx_active = 0U;
 
             finished_kind = current_tx_kind;
+
             current_tx_kind = TX_KIND_NONE;
 
             UTIL_TIMER_Start(&timerLed);
+
 
             if (finished_kind == TX_KIND_DATA)
             {
@@ -832,12 +1201,13 @@ static void LoRa_Process(void)
                     BRIDGE_ACK_TIMEOUT_MS;
             }
             else if ((finished_kind == TX_KIND_ACK) &&
-                     waiting_ack)
+                     (waiting_ack != 0U))
             {
                 ack_deadline_ms =
                     HAL_GetTick() +
                     BRIDGE_ACK_TIMEOUT_MS;
             }
+
 
             Radio.Sleep();
 
@@ -846,16 +1216,19 @@ static void LoRa_Process(void)
             break;
         }
 
-        /* ---------------------------------
+
+        /* -------------------------------------------------
          * TX TIMEOUT
-         * --------------------------------- */
+         * ------------------------------------------------- */
 
         case EVENT_TX_TIMEOUT:
         {
             radio_tx_active = 0U;
 
             finished_kind = current_tx_kind;
+
             current_tx_kind = TX_KIND_NONE;
+
 
             UTIL_TIMER_Stop(&timerLed);
 
@@ -865,9 +1238,11 @@ static void LoRa_Process(void)
                 GPIO_PIN_RESET
             );
 
+
             Radio.Sleep();
 
             LoRa_StartRx();
+
 
             if (finished_kind == TX_KIND_DATA)
             {
@@ -885,9 +1260,10 @@ static void LoRa_Process(void)
             break;
         }
 
-        /* ---------------------------------
+
+        /* -------------------------------------------------
          * RX TIMEOUT / RX ERROR
-         * --------------------------------- */
+         * ------------------------------------------------- */
 
         case EVENT_RX_TIMEOUT:
         case EVENT_RX_ERROR:
@@ -899,6 +1275,7 @@ static void LoRa_Process(void)
             break;
         }
 
+
         case EVENT_NONE:
         default:
         {
@@ -906,18 +1283,26 @@ static void LoRa_Process(void)
         }
     }
 
-    /* Process pending ACK / DATA / retries */
+
+    /* =====================================================
+     * PROCESS PENDING DATA / ACK / RETRY
+     * ===================================================== */
+
     Bridge_Service();
 
-    /* Stop timer when the bridge is idle */
-    if (bridge_timer_active &&
-        !outgoing_valid &&
-        !waiting_ack &&
-        !ack_pending &&
-        !radio_tx_active)
-    {
-        UTIL_TIMER_Stop(&timerBridge);
 
-        bridge_timer_active = 0U;
-    }
+    /*
+     * IMPORTANT:
+     *
+     * Do not stop timerBridge here.
+     *
+     * The 10 ms timer must keep running even when:
+     *
+     * - No LoRa packet is being transmitted
+     * - No ACK is pending
+     * - No UART data is waiting
+     *
+     * Otherwise local WinForms commands can suffer
+     * long processing delays again.
+     */
 }

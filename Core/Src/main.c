@@ -10,7 +10,7 @@
 #include "app_inputs.h"
 #include "rs485.h"
 #include "board_config.h"
-
+#include "bridge_config.h"
 /* =========================================================
  * FUNCTION PROTOTYPES
  * ========================================================= */
@@ -29,6 +29,8 @@ int main(void)
 
     /* Configure system clock */
     SystemClock_Config();
+
+    BridgeConfig_Init();
 
     /* Initialize GPIO */
     MX_GPIO_Init();
@@ -52,6 +54,7 @@ int main(void)
 
     /* Initialize 4 opto inputs */
     Inputs_Init();
+
 
     /*
      * Initialize LoRa middleware:
